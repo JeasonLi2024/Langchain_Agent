@@ -1,0 +1,33 @@
+# Core Framework
+langchain>=0.2.0
+langchain-core>=0.2.0
+langchain-community>=0.2.0
+langgraph>=0.1.0
+
+# Vector Store
+langchain-milvus
+pymilvus
+
+# LLM & Embeddings Provider
+dashscope>=1.19.0
+openai
+
+# Database & Environment
+pymysql
+python-dotenv
+django>=4.2  # Required for model imports, though usually provided by host environment
+
+# Data Processing & Parsing
+numpy
+scikit-learn
+pypdf
+unstructured
+python-docx
+langchain-text-splitters
+
+# Server
+fastapi
+uvicorn
+langserve
+sse-starlette
+
