@@ -44,6 +44,7 @@ tmp/
 error.txt
 logs/
 *.log
+.langgraph_api/
 
 # OS
 .DS_Store
