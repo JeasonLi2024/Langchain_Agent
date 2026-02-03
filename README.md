@@ -189,7 +189,7 @@ source /home/bupt/Server_Project_ZH/venv/bin/activate
 langgraph dev --host 0.0.0.0
 ```
 *   访问LangSmith Studio (Web UI) 连接此远程服务器。
-    *   在左侧选择studio,右侧选择“Configure connection”，在“Base URL”中输入服务器的公网 IP 或域名（`https://10.3.120.200:2024`）即可查看可视化过程。
+    *   在左侧选择studio,右侧选择“Configure connection”，在“Base URL”中输入服务器的公网 IP 或域名（`http://10.3.120.200:2024`）即可查看可视化过程。
 *   与智能体交互时，LangSmith 会记录每轮对话、状态更新及工具调用。
 
 ### 3. 启动Agent_Chat_UI
@@ -199,7 +199,7 @@ langgraph dev --host 0.0.0.0
 pnpm dev
 ```
 *   访问`http://10.3.120.200:3000` 进入Agent_Chat_UI界面。
-*   输入“Deployment URL”为： `https://10.3.120.200:2024`,"Graph ID"从文件langgraph.json中的`graphs`字段选择(如`main_agent`或`publisher_agent`)并输入 LangSmith API key（从LangSmith Studio获取，参考`https://docs.langchain.com/langsmith/create-account-api-key`）即可连接到 LangGraph Server。
+*   输入“Deployment URL”为： `http://10.3.120.200:2024`,"Graph ID"从文件langgraph.json中的`graphs`字段选择(如`main_agent`或`publisher_agent`)并输入 LangSmith API key（从LangSmith Studio获取，参考`https://docs.langchain.com/langsmith/create-account-api-key`）即可连接到 LangGraph Server。
 *   与智能体对话时，Agent_Chat_UI 会显示智能体的回复，同时在 LangSmith Studio 中查看详细的流程可视化。
 
 
@@ -209,7 +209,7 @@ pnpm dev
 
 ```bash
 docker-compose ps -a
-``` 
+```
     *   确保Milvus容器状态为`Up`，表示正常运行。若容器状态为`Exited`，可输入指令重启容器：
 
 ```bash

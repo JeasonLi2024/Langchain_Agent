@@ -157,8 +157,8 @@ def rerank_node(state: AgentState):
              
         # --- Content-based Deduplication ---
         # Generate a signature for the requirement content
-        title = data.get('title', '').strip()
-        desc = data.get('description', '').strip()
+        title = (data.get('title') or '').strip()
+        desc = (data.get('description') or '').strip()
         # Create a simple signature: Title + first 100 chars of description (normalized)
         signature = f"{title.lower()}_{desc[:100].lower()}"
         

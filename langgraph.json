@@ -1,7 +1,8 @@
 {
   "graphs": {
     "main_agent": "./graph/main_agent.py:master_app",
-    "publisher_agent": "./graph/publisher_main_agent.py:publisher_main_app"
+    "publisher_agent": "./graph/publisher_main_agent.py:publisher_main_app",
+    "qa_agent": "./graph/qa_agent.py:qa_app"
   },
   "env": ".env",
   "dependencies": [
