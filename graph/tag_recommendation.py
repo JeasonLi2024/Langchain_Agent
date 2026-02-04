@@ -8,9 +8,10 @@ from langchain_core.prompts import ChatPromptTemplate
 from core.config import Config
 from core.prompts import TAG_RECOMMENDATION_SYSTEM_PROMPT, TAG_RECOMMENDATION_HUMAN_PROMPT
 from tools.search_tools import extract_keywords, retrieve_tags
+from langchain_core.runnables import RunnableConfig
 
 # Removed @tool decorator to use as a regular function in graph node
-def recommend_tags_logic(description: str, research_direction: str, skill: str) -> str:
+def recommend_tags_logic(description: str, research_direction: str, skill: str, config: RunnableConfig = None) -> str:
     """
     Recommend 3 interest tags and 5 skill tags based on project requirement details.
     Returns a string containing the thinking process and the final JSON result.
@@ -43,6 +44,6 @@ def recommend_tags_logic(description: str, research_direction: str, skill: str) 
     response = chain.invoke({
         "query_text": query_text,
         "context": context_str
-    })
+    }, config=config)
     
     return response.content

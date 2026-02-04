@@ -157,8 +157,8 @@ def rerank_node(state: AgentState):
              
         # --- Content-based Deduplication ---
         # Generate a signature for the requirement content
-        title = (data.get('title') or '').strip()
-        desc = (data.get('description') or '').strip()
+        title = data.get('title', '').strip()
+        desc = data.get('description', '').strip()
         # Create a simple signature: Title + first 100 chars of description (normalized)
         signature = f"{title.lower()}_{desc[:100].lower()}"
         
@@ -177,7 +177,9 @@ def rerank_node(state: AgentState):
     candidates_list.sort(key=lambda x: x["final_score"], reverse=True)
     return {"ranked_projects": candidates_list[:15]}
 
-def reasoning_gen_node(state: AgentState):
+from langchain_core.runnables import RunnableConfig
+
+def reasoning_gen_node(state: AgentState, config: RunnableConfig):
     """
     Step 4: LLM Generation (Selection & Reasoning).
     """
@@ -208,17 +210,14 @@ def reasoning_gen_node(state: AgentState):
         "user_input": user_input,
         "tags_info": tags_json,
         "projects": projects_json
-    })
+    }, config=config)
     
     full_content = response.content
     
-    # Extract visible content
-    # We want to show the thinking process, so we extract the <thinking> block.
-    thinking_match = re.search(r'<thinking>(.*?)</thinking>', full_content, re.DOTALL)
-    public_content = thinking_match.group(1).strip() if thinking_match else full_content
-    
+    # Return full content to frontend, let frontend handle parsing.
+    # Frontend can extract <thinking> block for display and ignore JSON block.
     return {
-        "messages": [AIMessage(content=public_content)],
+        "messages": [AIMessage(content=full_content, name="reasoning")],
         "final_output": full_content
     }
 

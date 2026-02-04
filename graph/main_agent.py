@@ -134,7 +134,9 @@ def router_node(state: MasterState):
     except:
         return {"next_step": "chat_response"}
 
-def chat_node(state: MasterState):
+from langchain_core.runnables import RunnableConfig
+
+def chat_node(state: MasterState, config: RunnableConfig):
     """General Chat Node."""
     llm = Config.get_utility_llm()
     messages = state["messages"]
@@ -152,7 +154,7 @@ def chat_node(state: MasterState):
     ])
     
     chain = prompt | llm
-    response = chain.invoke({"messages": messages})
+    response = chain.invoke({"messages": messages}, config=config)
     return {"messages": [response]}
 
 def prep_recommendation_node(state: MasterState):
@@ -164,7 +166,7 @@ def prep_recommendation_node(state: MasterState):
         "profile_data": {} 
     }
 
-def summarize_recommendation_node(state: MasterState):
+def summarize_recommendation_node(state: MasterState, config: RunnableConfig):
     """Summarize the result from the subgraph."""
     profile_data = state.get("profile_data", {})
     user_input = state.get("user_input", "")
@@ -189,14 +191,14 @@ def summarize_recommendation_node(state: MasterState):
     response = chain.invoke({
         "user_input": user_input,
         "json_data": json.dumps(profile_data, ensure_ascii=False)
-    })
+    }, config=config)
     
     return {
         "messages": [response],
         "user_profile": profile_data
     }
 
-def project_qa_node(state: MasterState):
+def project_qa_node(state: MasterState, config: RunnableConfig):
     """
     QA Node for specific projects.
     Retrieves chunks from Milvus (Raw Docs -> Embeddings fallback) and answers questions.
@@ -286,7 +288,7 @@ def project_qa_node(state: MasterState):
         "target_id": target_id,
         "context": f"Source: {source}\n\n{context_text}",
         "question": full_question_context
-    })
+    }, config=config)
     
     return {"messages": [response]}
 

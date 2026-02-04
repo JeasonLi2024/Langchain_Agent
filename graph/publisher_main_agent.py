@@ -259,7 +259,9 @@ def file_parsing_node(state: PublisherMasterState):
             "messages": [AIMessage(content=f"文件解析失败：{result.get('error')}")]
         }
 
-def publisher_bridge_node(state: PublisherMasterState):
+from langchain_core.runnables import RunnableConfig
+
+def publisher_bridge_node(state: PublisherMasterState, config: RunnableConfig):
     """
     Bridge to Publisher Agent.
     """
@@ -295,7 +297,7 @@ def publisher_bridge_node(state: PublisherMasterState):
         pass
 
     # Run Publisher Agent
-    result = publisher_app.invoke(publisher_inputs)
+    result = publisher_app.invoke(publisher_inputs, config=config)
     
     # Capture output
     final_messages = result["messages"]

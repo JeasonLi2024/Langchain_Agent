@@ -36,7 +36,9 @@ class QAState(TypedDict):
 
 # --- 2. Define Nodes ---
 
-def qa_node(state: QAState):
+from langchain_core.runnables import RunnableConfig
+
+def qa_node(state: QAState, config: RunnableConfig):
     """
     Standalone QA Node for specific projects.
     Retrieves chunks from Milvus (Raw Docs -> Embeddings fallback) and answers questions.
@@ -129,7 +131,7 @@ def qa_node(state: QAState):
         "target_id": target_id,
         "context": f"Source: {source}\n\n{context_text}",
         "question": full_question_context
-    })
+    }, config=config)
     
     return {"messages": [response]}
 

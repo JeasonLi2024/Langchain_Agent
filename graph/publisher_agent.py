@@ -6,7 +6,6 @@ from langchain_core.tools import tool
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from core.config import Config
-from core.prompts import PUBLISHER_AGENT_SYSTEM_PROMPT
 from project.models import Requirement
 from user.models import OrganizationUser, User, Tag1, Tag2
 from graph.tag_recommendation import recommend_tags_logic
@@ -135,9 +134,11 @@ def recommend_tags():
     """
     return "Starting tag recommendation..."
 
+from langchain_core.runnables import RunnableConfig
+
 # --- Nodes ---
 
-def chat_node(state: PublisherState):
+def chat_node(state: PublisherState, config: RunnableConfig):
     """
     Main interaction node.
     """
@@ -184,11 +185,11 @@ def chat_node(state: PublisherState):
     llm_with_tools = llm.bind_tools([save_requirement, recommend_tags])
     
     # Invoke
-    response = llm_with_tools.invoke([SystemMessage(content=system_msg)] + messages)
+    response = llm_with_tools.invoke([SystemMessage(content=system_msg)] + messages, config=config)
     
     return {"messages": [response]}
 
-def tag_recommendation_node(state: PublisherState):
+def tag_recommendation_node(state: PublisherState, config: RunnableConfig):
     """
     Node to handle tag recommendation logic.
     Acts as the execution of 'recommend_tags' tool.
@@ -199,7 +200,7 @@ def tag_recommendation_node(state: PublisherState):
     skill = draft_data.get("skill", "")
     
     # Call the logic
-    result_text = recommend_tags_logic(description, research_direction, skill)
+    result_text = recommend_tags_logic(description, research_direction, skill, config=config)
     
     # Find the tool call ID to respond to
     last_message = state["messages"][-1]
