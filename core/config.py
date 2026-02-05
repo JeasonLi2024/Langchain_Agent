@@ -65,6 +65,9 @@ class Config:
     DASHSCOPE_API_KEY = os.getenv('DASHSCOPE_API_KEY')
     MILVUS_HOST = os.getenv('MILVUS_HOST', 'localhost')
     MILVUS_PORT = os.getenv('MILVUS_PORT', '19530')
+    REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
+    REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
+    REDIS_DB = int(os.getenv('REDIS_DB', 5))
 
     # Model Configurations
     LLM_MODEL_UTILITY = os.getenv("LLM_MODEL_UTILITY", "qwen-turbo")

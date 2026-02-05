@@ -26,6 +26,10 @@ from core.embedding_service import generate_embedding, get_or_create_collection,
 from project.services import delete_requirement_vectors, sync_raw_docs_from_text
 from project.models import Requirement
 
+# Import custom PickleRedisSaver
+from core.persistence import PickleRedisSaver
+import redis
+
 # --- 1. Define State ---
 class PublisherMasterState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
@@ -71,14 +75,14 @@ def cleanup_stale_files():
     except Exception as e:
         print(f"Error during stale file cleanup: {e}")
 
-def router_node(state: PublisherMasterState):
+async def router_node(state: PublisherMasterState):
     """
     Router for Publisher Agent.
     Decides entry point based on file upload or user intent.
     Handles Multimodal Messages (Base64 file uploads).
     """
     # Trigger cleanup opportunistically
-    cleanup_stale_files()
+    # cleanup_stale_files() # Removed to avoid sync blocking, rely on background task
     
     file_path = state.get("file_path")
     original_filename = state.get("original_filename")
@@ -476,6 +480,17 @@ def check_sync(state: PublisherMasterState):
 workflow.add_conditional_edges("publisher_flow", check_sync, ["vector_sync", END])
 workflow.add_edge("vector_sync", END)
 
-# Add checkpointer for state persistence and HITL support
-# checkpointer = MemorySaver()
-publisher_main_app = workflow.compile() # checkpointer=checkpointer
+# Setup Redis Checkpointer
+redis_host = Config.REDIS_HOST
+redis_port = Config.REDIS_PORT
+redis_db = Config.REDIS_DB
+
+try:
+    conn = redis.Redis(host=redis_host, port=redis_port, db=redis_db)
+    checkpointer = PickleRedisSaver(client=conn)
+except Exception as e:
+    print(f"Warning: Failed to initialize Redis checkpointer for Publisher: {e}. Fallback to MemorySaver.")
+    from langgraph.checkpoint.memory import MemorySaver
+    checkpointer = MemorySaver()
+
+publisher_main_app = workflow.compile(checkpointer=checkpointer)

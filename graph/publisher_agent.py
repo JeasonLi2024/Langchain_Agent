@@ -138,7 +138,7 @@ from langchain_core.runnables import RunnableConfig
 
 # --- Nodes ---
 
-def chat_node(state: PublisherState, config: RunnableConfig):
+async def chat_node(state: PublisherState, config: RunnableConfig):
     """
     Main interaction node.
     """
@@ -185,11 +185,11 @@ def chat_node(state: PublisherState, config: RunnableConfig):
     llm_with_tools = llm.bind_tools([save_requirement, recommend_tags])
     
     # Invoke
-    response = llm_with_tools.invoke([SystemMessage(content=system_msg)] + messages, config=config)
+    response = await llm_with_tools.ainvoke([SystemMessage(content=system_msg)] + messages, config=config)
     
     return {"messages": [response]}
 
-def tag_recommendation_node(state: PublisherState, config: RunnableConfig):
+async def tag_recommendation_node(state: PublisherState, config: RunnableConfig):
     """
     Node to handle tag recommendation logic.
     Acts as the execution of 'recommend_tags' tool.
@@ -200,7 +200,7 @@ def tag_recommendation_node(state: PublisherState, config: RunnableConfig):
     skill = draft_data.get("skill", "")
     
     # Call the logic
-    result_text = recommend_tags_logic(description, research_direction, skill, config=config)
+    result_text = await recommend_tags_logic(description, research_direction, skill, config=config)
     
     # Find the tool call ID to respond to
     last_message = state["messages"][-1]

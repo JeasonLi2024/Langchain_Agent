@@ -1,7 +1,7 @@
 
+import os
 import json
 import sys
-import os
 import django
 
 # Add parent directory to sys.path to resolve relative imports when running as script/module
@@ -27,6 +27,10 @@ from core.prompts import (
 )
 from graph.student_workflow import app as recommendation_graph
 from tools.new_search_tools import retrieve_project_chunks, retrieve_project_summary
+
+# Import custom PickleRedisSaver
+from core.persistence import PickleRedisSaver
+import redis
 
 def get_last_message_text(messages: List[BaseMessage]) -> str:
     """Helper to extract text from the last message, handling list-based content."""
@@ -79,6 +83,9 @@ def router_node(state: MasterState):
     - 'project_qa_flow': Specific project questions.
     - 'chat_response': General chat.
     """
+    return _router_node_impl(state)
+
+async def _router_node_impl(state):
     messages = state["messages"]
     last_user_msg = get_last_message_text(messages)
     user_profile = state.get("user_profile", {})
@@ -98,7 +105,70 @@ def router_node(state: MasterState):
     prompt = MAIN_ROUTER_PROMPT
     
     try:
-        response = llm.invoke(prompt.format(
+        response = await llm.ainvoke(prompt.format(
+            message=last_user_msg, 
+            has_recommendations=has_recommendations,
+            recommendation_context=recommendation_context
+        ))
+        # Parse JSON output (assuming LLM returns JSON or we parse it)
+        content = response.content.strip()
+        # Heuristic parsing if LLM is chatty
+        import re
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        if json_match:
+            result = json.loads(json_match.group(0))
+        else:
+            # Fallback text parsing
+            if "RECOMMEND" in content: result = {"intent": "RECOMMEND"}
+            elif "PROJECT_QA" in content: result = {"intent": "PROJECT_QA", "target_id": 0} # Need ID extraction logic
+            else: result = {"intent": "CHAT"}
+            
+        intent = result.get("intent", "CHAT").upper()
+        target_id = result.get("target_id", 0)
+        
+        # Simple regex fallback for ID if LLM missed it
+        if intent == "PROJECT_QA" and not target_id:
+            id_match = re.search(r'(\d{3,})', last_user_msg) # Look for 3+ digit numbers
+            if id_match:
+                target_id = int(id_match.group(1))
+        
+        if intent == "RECOMMEND":
+            return {"next_step": "recommendation_flow"}
+        elif intent == "PROJECT_QA" and target_id:
+            return {"next_step": "project_qa_flow", "target_project_id": target_id}
+        else:
+            return {"next_step": "chat_response"}
+    except:
+        return {"next_step": "chat_response"}
+
+async def router_node(state: MasterState):
+    """
+    Main Agent (Router).
+    Analyzes user intent and routes to:
+    - 'recommendation_flow': New recommendations.
+    - 'project_qa_flow': Specific project questions.
+    - 'chat_response': General chat.
+    """
+    messages = state["messages"]
+    last_user_msg = get_last_message_text(messages)
+    user_profile = state.get("user_profile", {})
+    has_recommendations = "Yes" if user_profile else "No"
+    
+    # Enhanced Intent Classification
+    llm = Config.get_utility_llm()
+    
+    # Format recommendation context for the LLM
+    recommendation_context = ""
+    if user_profile and "recommended_projects" in user_profile:
+        projects = user_profile["recommended_projects"]
+        recommendation_context = "User has received these recommendations:\n"
+        for i, p in enumerate(projects):
+            recommendation_context += f"{i+1}. [ID: {p.get('id')}] {p.get('title')}\n"
+    
+    prompt = MAIN_ROUTER_PROMPT
+    
+    try:
+        response = await llm.ainvoke(prompt.format(
             message=last_user_msg, 
             has_recommendations=has_recommendations,
             recommendation_context=recommendation_context
@@ -136,7 +206,7 @@ def router_node(state: MasterState):
 
 from langchain_core.runnables import RunnableConfig
 
-def chat_node(state: MasterState, config: RunnableConfig):
+async def chat_node(state: MasterState, config: RunnableConfig):
     """General Chat Node."""
     llm = Config.get_utility_llm()
     messages = state["messages"]
@@ -154,10 +224,10 @@ def chat_node(state: MasterState, config: RunnableConfig):
     ])
     
     chain = prompt | llm
-    response = chain.invoke({"messages": messages}, config=config)
+    response = await chain.ainvoke({"messages": messages}, config=config)
     return {"messages": [response]}
 
-def prep_recommendation_node(state: MasterState):
+async def prep_recommendation_node(state: MasterState):
     """Prepare input for recommendation subgraph."""
     user_info = state.get("user_info", {})
     return {
@@ -166,7 +236,7 @@ def prep_recommendation_node(state: MasterState):
         "profile_data": {} 
     }
 
-def summarize_recommendation_node(state: MasterState, config: RunnableConfig):
+async def summarize_recommendation_node(state: MasterState, config: RunnableConfig):
     """Summarize the result from the subgraph."""
     profile_data = state.get("profile_data", {})
     user_input = state.get("user_input", "")
@@ -188,7 +258,7 @@ def summarize_recommendation_node(state: MasterState, config: RunnableConfig):
     summary_prompt = RECOMMENDATION_SUMMARY_PROMPT
     
     chain = ChatPromptTemplate.from_template(summary_prompt) | llm
-    response = chain.invoke({
+    response = await chain.ainvoke({
         "user_input": user_input,
         "json_data": json.dumps(profile_data, ensure_ascii=False)
     }, config=config)
@@ -198,7 +268,7 @@ def summarize_recommendation_node(state: MasterState, config: RunnableConfig):
         "user_profile": profile_data
     }
 
-def project_qa_node(state: MasterState, config: RunnableConfig):
+async def project_qa_node(state: MasterState, config: RunnableConfig):
     """
     QA Node for specific projects.
     Retrieves chunks from Milvus (Raw Docs -> Embeddings fallback) and answers questions.
@@ -239,7 +309,7 @@ def project_qa_node(state: MasterState, config: RunnableConfig):
             Standalone question:
         """)
         try:
-            res = (condense_prompt | llm).invoke({
+            res = await (condense_prompt | llm).ainvoke({
                 "chat_history": history_str, 
                 "question": last_question
             })
@@ -251,7 +321,7 @@ def project_qa_node(state: MasterState, config: RunnableConfig):
     # Strategy: Try Raw Docs -> If empty -> Try Embeddings (Summary)
     
     # A. Search Raw Docs
-    context_chunks = retrieve_project_chunks.invoke({
+    context_chunks = await retrieve_project_chunks.ainvoke({
         "project_ids": [target_id],
         "query": standalone_question
     })
@@ -260,7 +330,7 @@ def project_qa_node(state: MasterState, config: RunnableConfig):
     
     # B. Fallback to Embeddings
     if not chunks_list:
-        summary_chunks = retrieve_project_summary.invoke({
+        summary_chunks = await retrieve_project_summary.ainvoke({
             "project_ids": [target_id],
             "query": standalone_question
         })
@@ -284,13 +354,14 @@ def project_qa_node(state: MasterState, config: RunnableConfig):
     """
     
     chain = ChatPromptTemplate.from_template(qa_prompt) | llm
-    response = chain.invoke({
+    response = await chain.ainvoke({
         "target_id": target_id,
         "context": f"Source: {source}\n\n{context_text}",
         "question": full_question_context
     }, config=config)
     
     return {"messages": [response]}
+
 
 # --- 3. Build Master Graph ---
 workflow = StateGraph(MasterState)
@@ -323,4 +394,17 @@ workflow.add_edge("recommendation_worker", "summarize_recommendation")
 workflow.add_edge("summarize_recommendation", END)
 workflow.add_edge("project_qa_node", END)
 
-master_app = workflow.compile()
+# Setup Redis Checkpointer
+redis_host = Config.REDIS_HOST
+redis_port = Config.REDIS_PORT
+redis_db = Config.REDIS_DB
+
+try:
+    conn = redis.Redis(host=redis_host, port=redis_port, db=redis_db)
+    checkpointer = PickleRedisSaver(client=conn)
+except Exception as e:
+    print(f"Warning: Failed to initialize Redis checkpointer: {e}. Fallback to MemorySaver.")
+    from langgraph.checkpoint.memory import MemorySaver
+    checkpointer = MemorySaver()
+
+master_app = workflow.compile(checkpointer=checkpointer)

@@ -41,7 +41,7 @@ class AgentState(TypedDict):
 
 # --- 2. Define Nodes ---
 
-def analyze_query_node(state: AgentState):
+async def analyze_query_node(state: AgentState):
     """
     Step 1: Analyze user input to extract Keywords and Tags.
     """
@@ -60,7 +60,7 @@ def analyze_query_node(state: AgentState):
         user_input = str(user_input)
         
     # 1. Extract Keywords (LLM)
-    keywords = extract_keywords.invoke(user_input)
+    keywords = await extract_keywords.ainvoke(user_input)
     
     # 2. Extract Tags (Vector Search in Tag KB)
     # We construct queries from user input + extracted keywords
@@ -70,7 +70,7 @@ def analyze_query_node(state: AgentState):
     elif isinstance(keywords, str):
         queries.append(keywords)
         
-    tag_result = retrieve_tags.invoke({"queries": queries})
+    tag_result = await retrieve_tags.ainvoke({"queries": queries})
     
     return {
         "user_input": user_input,
@@ -81,43 +81,45 @@ def analyze_query_node(state: AgentState):
         "skill_tags": tag_result.get('skill_tags', [])
     }
 
-def track_tag_recall(state: AgentState):
+async def track_tag_recall(state: AgentState):
     """Track 1: Tag-based (Precise)"""
     interest_ids = state.get('interest_ids', [])
     skill_ids = state.get('skill_ids', [])
     
-    results = search_projects_by_tags.invoke({
+    results = await search_projects_by_tags.ainvoke({
         "interest_ids": interest_ids, 
         "skill_ids": skill_ids
     })
     for p in results: p["source"] = "tag"
     return {"tag_candidates": results}
 
-def track_semantic_recall(state: AgentState):
+async def track_semantic_recall(state: AgentState):
     """Track 2: Semantic (Fuzzy)"""
     user_input = state['user_input']
-    results = search_projects_semantic.invoke({
+    results = await search_projects_semantic.ainvoke({
         "query": user_input, 
         "k": 5
     })
     for p in results: p["source"] = "semantic"
     return {"semantic_candidates": results}
 
-def track_keyword_recall(state: AgentState):
+async def track_keyword_recall(state: AgentState):
     """Track 3: Keyword (Literal)"""
     keywords = state.get('keywords', [])
-    results = search_projects_fulltext.invoke({
+    results = await search_projects_fulltext.ainvoke({
         "keywords": keywords, 
         "k": 5
     })
     for p in results: p["source"] = "keyword"
     return {"keyword_candidates": results}
 
-def rerank_node(state: AgentState):
+async def rerank_node(state: AgentState):
     """
     Step 3: Merge and Rerank.
     Includes content-based deduplication.
     """
+    # Reranking is mostly CPU bound, but making it async ensures consistent graph execution
+    # and allows yielding control if needed.
     candidates = {}
     
     def merge(source_list, source_name):
@@ -177,9 +179,10 @@ def rerank_node(state: AgentState):
     candidates_list.sort(key=lambda x: x["final_score"], reverse=True)
     return {"ranked_projects": candidates_list[:15]}
 
+
 from langchain_core.runnables import RunnableConfig
 
-def reasoning_gen_node(state: AgentState, config: RunnableConfig):
+async def reasoning_gen_node(state: AgentState, config: RunnableConfig):
     """
     Step 4: LLM Generation (Selection & Reasoning).
     """
@@ -206,7 +209,7 @@ def reasoning_gen_node(state: AgentState, config: RunnableConfig):
     ])
     
     chain = prompt | llm
-    response = chain.invoke({
+    response = await chain.ainvoke({
         "user_input": user_input,
         "tags_info": tags_json,
         "projects": projects_json
@@ -221,7 +224,7 @@ def reasoning_gen_node(state: AgentState, config: RunnableConfig):
         "final_output": full_content
     }
 
-def reasoning_parse_node(state: AgentState):
+async def reasoning_parse_node(state: AgentState):
     """Step 5: Parse JSON."""
     content = state['final_output']
     profile_data = {}

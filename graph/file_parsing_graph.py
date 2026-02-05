@@ -31,13 +31,15 @@ class FileParsingState(TypedDict):
 
 # --- Nodes ---
 
-def loader_node(state: FileParsingState):
+async def loader_node(state: FileParsingState):
     """Load file content based on extension."""
     file_path = state['file_path']
     if not os.path.exists(file_path):
         return {"success": False, "error": f"File not found: {file_path}"}
         
     try:
+        # File IO is blocking, but okay for local files.
+        # Ideally wrap in run_in_executor if heavy.
         if file_path.lower().endswith('.pdf'):
             # Using PyPDFLoader for PDF which can extract text from tables if they are text-based.
             # If tables are images, OCR would be needed (e.g., Unstructured with OCR), 
@@ -62,7 +64,7 @@ def loader_node(state: FileParsingState):
 
 # EmbeddingService is already imported from core.embedding_service
 
-def cleaner_node(state: FileParsingState):
+async def cleaner_node(state: FileParsingState):
     """Clean and split text."""
     if not state.get('success', True):
         return {}
@@ -90,7 +92,7 @@ def cleaner_node(state: FileParsingState):
     
     return {"chunks": valid_chunks}
 
-def ranking_node(state: FileParsingState):
+async def ranking_node(state: FileParsingState):
     """Rank and filter chunks using vector similarity."""
     if not state.get('success', True):
         return {}
@@ -104,13 +106,19 @@ def ranking_node(state: FileParsingState):
     
     try:
         # Embed query
-        query_vec = generate_embedding(query)
+        query_vec = generate_embedding(query) # This is wrapper, let's keep it sync or make async wrapper. 
+        # But generate_embedding is sync wrapper. Let's use EmbeddingService.aget_single_embedding if possible or just accept one sync call.
+        # Ideally: query_vec = await EmbeddingService.aget_single_embedding(query) (I didn't add aget_single_embedding yet)
+        # I'll just use aget_embeddings([query])[0]
+        query_vecs = await EmbeddingService.aget_embeddings([query])
+        query_vec = query_vecs[0] if query_vecs else None
+
         if not query_vec:
             logger.error("Failed to generate query embedding")
             return {"filtered_chunks": chunks[:10]}
             
-        # Embed chunks (Use Batch API for consistency)
-        chunk_vecs = EmbeddingService.get_embeddings(chunks)
+        # Embed chunks (Use Async Batch API)
+        chunk_vecs = await EmbeddingService.aget_embeddings(chunks)
         
         # Filter invalid embeddings
         valid_indices = [i for i, v in enumerate(chunk_vecs) if v and len(v) > 0]
@@ -142,7 +150,7 @@ def ranking_node(state: FileParsingState):
         logger.error(f"Ranking failed: {e}")
         return {"filtered_chunks": chunks[:10]}
 
-def extraction_node(state: FileParsingState):
+async def extraction_node(state: FileParsingState):
     """Extract structured info using LLM."""
     if not state.get('success', True):
         return {}
@@ -208,7 +216,7 @@ def extraction_node(state: FileParsingState):
             temperature=0.1 # Low temp as requested
         )
         
-        response = llm_extraction.invoke(prompt)
+        response = await llm_extraction.ainvoke(prompt)
         content = response.content
         
         # Clean markdown code blocks if present
@@ -242,7 +250,7 @@ def extraction_node(state: FileParsingState):
 
 # Removed summary_node in favor of extraction_node
 
-def vector_store_node(state: FileParsingState):
+async def vector_store_node(state: FileParsingState):
     """Store chunks to Milvus (project_raw_docs)."""
     # Only store if we have a draft_id (i.e. requirement created)
     # If draft_id is not present, we skip this step (Agent will handle creation first)
@@ -263,9 +271,8 @@ def vector_store_node(state: FileParsingState):
     if not chunk_embeddings or len(chunk_embeddings) != len(chunks):
         logger.warning("Embeddings missing or mismatch in vector_store_node. Regenerating...")
         chunk_embeddings = []
-        for chunk in chunks:
-            v = generate_embedding(chunk)
-            chunk_embeddings.append(v if v else [])
+        # Regenerate async
+        chunk_embeddings = await EmbeddingService.aget_embeddings(chunks)
             
     try:
         collection = get_or_create_collection(COLLECTION_RAW_DOCS)
@@ -297,6 +304,7 @@ def vector_store_node(state: FileParsingState):
         logger.info(f"Stored {len(vectors)} chunks for draft {draft_id}")
         return {"success": True}
         
+
     except Exception as e:
         logger.error(f"Vector storage failed: {e}")
         return {"success": False, "error": str(e)}

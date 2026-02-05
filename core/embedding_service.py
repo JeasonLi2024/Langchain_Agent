@@ -229,6 +229,128 @@ class EmbeddingService:
         embeddings = EmbeddingService.get_embeddings([text], use_cache=use_cache)
         return embeddings[0] if embeddings else [0.0] * DEFAULT_EMBEDDING_DIM
 
+    @staticmethod
+    async def aget_embeddings(texts: List[str], use_cache: bool = True) -> List[List[float]]:
+        """
+        Async Batch get embeddings with cache support.
+        """
+        if not texts:
+            return []
+            
+        # Try to use Django cache (sync access is acceptable for memory cache, 
+        # for redis it blocks but it's fast. Ideally use sync_to_async or async cache client)
+        cache = None
+        try:
+            from django.core.cache import cache as django_cache
+            cache = django_cache
+        except (ImportError, Exception):
+            pass
+
+        if use_cache and cache:
+            try:
+                cached_embeddings = []
+                uncached_texts = []
+                uncached_indices = []
+                
+                for i, text in enumerate(texts):
+                    cache_key = f"embedding:v4:{hash(text)}"
+                    # Sync cache access
+                    cached_val = cache.get(cache_key)
+                    if cached_val:
+                        if len(cached_val) == DEFAULT_EMBEDDING_DIM:
+                            cached_embeddings.append((i, cached_val))
+                        else:
+                            uncached_texts.append(text)
+                            uncached_indices.append(i)
+                    else:
+                        uncached_texts.append(text)
+                        uncached_indices.append(i)
+                
+                if not uncached_texts:
+                    result = [None] * len(texts)
+                    for i, embedding in cached_embeddings:
+                        result[i] = embedding
+                    return result
+                
+                new_embeddings = await EmbeddingService._afetch_embeddings(uncached_texts)
+                
+                for i, text in enumerate(uncached_texts):
+                    if i < len(new_embeddings):
+                        cache_key = f"embedding:v4:{hash(text)}"
+                        cache.set(cache_key, new_embeddings[i], timeout=3600)
+                
+                result = [None] * len(texts)
+                for i, embedding in cached_embeddings:
+                    result[i] = embedding
+                for i, idx in enumerate(uncached_indices):
+                    if i < len(new_embeddings):
+                        result[idx] = new_embeddings[i]
+                return result
+            except Exception as e:
+                logger.warning(f"Async Cache operation failed: {e}. Proceeding without cache.")
+                return await EmbeddingService._afetch_embeddings(texts)
+        else:
+            return await EmbeddingService._afetch_embeddings(texts)
+
+    @staticmethod
+    async def _afetch_embeddings(texts: List[str]) -> List[List[float]]:
+        try:
+            from openai import AsyncOpenAI
+            api_key = os.getenv("DASHSCOPE_API_KEY")
+            if not api_key:
+                try:
+                    from core.config import Config
+                    api_key = getattr(Config, "DASHSCOPE_API_KEY", None)
+                except: pass
+            
+            if api_key:
+                client = AsyncOpenAI(api_key=api_key, base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
+                batch_size = 10
+                all_embeddings = []
+                
+                for i in range(0, len(texts), batch_size):
+                    batch = texts[i:i+batch_size]
+                    try:
+                        model_name = DEFAULT_EMBEDDING_MODEL
+                        try:
+                            from core.config import Config
+                            model_name = getattr(Config, "EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
+                        except: pass
+
+                        response = await client.embeddings.create(
+                            model=model_name,
+                            input=batch,
+                            dimensions=DEFAULT_EMBEDDING_DIM
+                        )
+                        batch_embeddings = [None] * len(batch)
+                        for item in response.data:
+                             if item.index < len(batch):
+                                 batch_embeddings[item.index] = item.embedding
+                        all_embeddings.extend(batch_embeddings)
+                    except Exception as batch_error:
+                         logger.error(f"[Async Embedding Batch ERROR] {batch_error}")
+                         all_embeddings.extend([None] * len(batch))
+                
+                final_embeddings = []
+                for emb in all_embeddings:
+                    if emb is None:
+                        final_embeddings.append([0.0] * DEFAULT_EMBEDDING_DIM)
+                    else:
+                        final_embeddings.append(emb)
+                return final_embeddings
+            
+            else:
+                # Fallback to sync run_in_executor
+                import asyncio
+                embedder = EmbeddingService.get_dashscope_embeddings()
+                loop = asyncio.get_running_loop()
+                return await loop.run_in_executor(None, embedder.embed_documents, texts)
+
+        except Exception as e:
+            logger.error(f"[Async Embedding ERROR] {e}")
+            return [[0.0] * DEFAULT_EMBEDDING_DIM for _ in texts]
+
+
 def generate_embedding(text: str) -> List[float]:
     """Wrapper for compatibility."""
     return EmbeddingService.get_single_embedding(text)

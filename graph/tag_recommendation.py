@@ -11,7 +11,7 @@ from tools.search_tools import extract_keywords, retrieve_tags
 from langchain_core.runnables import RunnableConfig
 
 # Removed @tool decorator to use as a regular function in graph node
-def recommend_tags_logic(description: str, research_direction: str, skill: str, config: RunnableConfig = None) -> str:
+async def recommend_tags_logic(description: str, research_direction: str, skill: str, config: RunnableConfig = None) -> str:
     """
     Recommend 3 interest tags and 5 skill tags based on project requirement details.
     Returns a string containing the thinking process and the final JSON result.
@@ -21,11 +21,11 @@ def recommend_tags_logic(description: str, research_direction: str, skill: str, 
     query_text = f"{description} {research_direction} {skill}"
     
     # 2. Extract Keywords
-    keywords = extract_keywords.invoke(query_text)
+    keywords = await extract_keywords.ainvoke(query_text)
     queries = [query_text] + keywords
     
     # 3. Retrieve Candidate Tags
-    retrieval_res = retrieve_tags.invoke({"queries": queries})
+    retrieval_res = await retrieve_tags.ainvoke({"queries": queries})
     context_str = retrieval_res['context_str']
     
     # 4. LLM Reasoning
@@ -41,7 +41,7 @@ def recommend_tags_logic(description: str, research_direction: str, skill: str, 
     # We use invoke here. For streaming, the calling node in LangGraph 
     # should be part of a stream capable graph. 
     # Since we want to stream tokens to the frontend, this node needs to be connected to the graph.
-    response = chain.invoke({
+    response = await chain.ainvoke({
         "query_text": query_text,
         "context": context_str
     }, config=config)
