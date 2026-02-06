@@ -1,11 +1,12 @@
 import json
-from typing import TypedDict, Annotated, List, Dict, Any, Literal, Optional
+from typing_extensions import TypedDict, Annotated, List, Dict, Any, Literal, Optional
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from core.config import Config
+from core.prompts import PUBLISHER_AGENT_SYSTEM_PROMPT
 from project.models import Requirement
 from user.models import OrganizationUser, User, Tag1, Tag2
 from graph.tag_recommendation import recommend_tags_logic
@@ -184,8 +185,32 @@ async def chat_node(state: PublisherState, config: RunnableConfig):
     # Bind tools (Both save_requirement and recommend_tags)
     llm_with_tools = llm.bind_tools([save_requirement, recommend_tags])
     
+    # Reconstruct messages to ensure correct type for ChatTongyi (Fix for TypeError: Got unknown type)
+    sanitized_messages = []
+    for m in messages:
+        content = m.content
+        if isinstance(content, list):
+             # Flatten multimodal content to text
+             text_parts = [
+                 item.get('text', '') 
+                 for item in content 
+                 if isinstance(item, dict) and item.get('type') == 'text'
+             ]
+             content = " ".join(text_parts)
+
+        if m.type == 'human':
+            sanitized_messages.append(HumanMessage(content=content))
+        elif m.type == 'ai':
+            sanitized_messages.append(AIMessage(content=content, additional_kwargs=m.additional_kwargs))
+        elif m.type == 'system':
+            sanitized_messages.append(SystemMessage(content=content))
+        elif m.type == 'tool':
+            sanitized_messages.append(ToolMessage(content=content, tool_call_id=m.tool_call_id, name=m.name))
+        else:
+            sanitized_messages.append(HumanMessage(content=str(content)))
+
     # Invoke
-    response = await llm_with_tools.ainvoke([SystemMessage(content=system_msg)] + messages, config=config)
+    response = await llm_with_tools.ainvoke([SystemMessage(content=system_msg)] + sanitized_messages, config=config)
     
     return {"messages": [response]}
 

@@ -1,11 +1,27 @@
 import os
 from typing import List, Optional
 from dotenv import load_dotenv
+
+# Load env variables BEFORE importing other modules that might rely on them or set defaults
+# 1. Try explicit ENV_FILE
+env_file = os.getenv("ENV_FILE")
+if env_file and os.path.exists(env_file):
+    load_dotenv(env_file)
+else:
+    # 2. Try .env in langchain-v2.0 root
+    current_dir = os.path.dirname(os.path.abspath(__file__)) # core/
+    root_dir = os.path.dirname(current_dir) # langchain-v2.0/
+    default_env = os.path.join(root_dir, ".env")
+    if os.path.exists(default_env):
+        load_dotenv(default_env)
+    else:
+        # 3. Fallback to standard load (current working dir)
+        load_dotenv()
+
 from langchain_community.chat_models import ChatTongyi
 from langchain_community.embeddings.dashscope import DashScopeEmbeddings, embed_with_retry
 from langchain_milvus import Milvus
 import pymysql
-
 import logging
 
 # Suppress Milvus async error logs
@@ -40,22 +56,6 @@ class CustomDashScopeEmbeddings(DashScopeEmbeddings):
         embedding = embed_with_retry(self, **kwargs)[0]["embedding"]
         return embedding
 
-# Load env
-# 1. Try explicit ENV_FILE
-env_file = os.getenv("ENV_FILE")
-if env_file and os.path.exists(env_file):
-    load_dotenv(env_file)
-else:
-    # 2. Try .env in langchain-v2.0 root
-    current_dir = os.path.dirname(os.path.abspath(__file__)) # core/
-    root_dir = os.path.dirname(current_dir) # langchain-v2.0/
-    default_env = os.path.join(root_dir, ".env")
-    if os.path.exists(default_env):
-        load_dotenv(default_env)
-    else:
-        # 3. Fallback to standard load (current working dir)
-        load_dotenv()
-
 class Config:
     DB_HOST = os.getenv('DB_HOST', 'localhost')
     DB_PORT = int(os.getenv('DB_PORT', 3306))
@@ -68,6 +68,10 @@ class Config:
     REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
     REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
     REDIS_DB = int(os.getenv('REDIS_DB', 5))
+
+    # PostgreSQL Checkpoints
+    # Password 'BuptZH@2025' must be URL-encoded (@ -> %40)
+    CHECKPOINT_DB_URI = os.getenv("CHECKPOINT_DB_URI", "postgresql://ai_agent:BuptZH%402025@localhost:5432/langgraph_checkpoints")
 
     # Model Configurations
     LLM_MODEL_UTILITY = os.getenv("LLM_MODEL_UTILITY", "qwen-turbo")

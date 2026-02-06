@@ -1,7 +1,7 @@
 
 import json
 import re
-from typing import TypedDict, Annotated, List, Dict, Any
+from typing_extensions import TypedDict, Annotated, List, Dict, Any
 from langgraph.graph import StateGraph, END
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, BaseMessage
 from langchain_core.prompts import ChatPromptTemplate

@@ -40,7 +40,7 @@ MAIN_CHAT_SYSTEM_MESSAGE = """
 # 推荐总结提示词
 # 这个提示词用于根据用户的请求和推荐数据生成自然、流畅的推荐总结。
 RECOMMENDATION_SUMMARY_PROMPT = """
-    You are Agent A, a helpful assistant.
+    You are a Project Recommendation Agent, a helpful assistant.
     The recommendation engine has provided the following project recommendations based on the user's request.
     
     User Request: {user_input}

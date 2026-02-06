@@ -10,6 +10,9 @@ langchain_root = os.path.dirname(current_dir)
 if langchain_root not in sys.path:
     sys.path.append(langchain_root)
 
+# Prioritize Local Env
+from core.config import Config
+
 # Setup Django (Required for pymilvus connection via Config if needed, or just to load .env)
 # Using core.django_setup to robustly load environment
 try:
@@ -17,10 +20,8 @@ try:
     setup_django()
 except ImportError:
     # Fallback if running directly in a simplified env
-    from dotenv import load_dotenv
-    load_dotenv(os.path.join(langchain_root, '.env'))
+    pass
 
-from core.config import Config
 from langchain_core.documents import Document
 
 # Configure logging
@@ -109,11 +110,6 @@ def vectorize_tags():
     # 3. Initialize Vector Stores
     # Using Config to get pre-configured Milvus instance with DashScope Embeddings
     
-    logger.info(f"Using Embedding Model: '{Config.EMBEDDING_MODEL}'")
-    logger.info(f"API Key Length: {len(Config.DASHSCOPE_API_KEY) if Config.DASHSCOPE_API_KEY else 0}")
-    if Config.DASHSCOPE_API_KEY:
-        logger.info(f"API Key ends with: {repr(Config.DASHSCOPE_API_KEY[-1])}")
-
     # Collection names must match what retrieval_tool.py expects:
     # "student_interests" for Tag 1
     # "student_skills" for Tag 2
@@ -121,8 +117,8 @@ def vectorize_tags():
     if docs_tag1:
         logger.info("Vectorizing Interest Tags to collection 'student_interests'...")
         try:
-            # Using v4 (1536) as configured in Config
             store_tag1 = Config.get_milvus_store("student_interests")
+            # Milvus.from_documents automatically handles collection creation and insertion
             store_tag1.add_documents(docs_tag1)
             logger.info("Successfully vectorized Interest Tags.")
         except Exception as e:

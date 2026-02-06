@@ -217,13 +217,14 @@ def search_projects_fulltext(keywords: list[str]) -> list[dict]:
 def retrieve_project_chunks(project_ids: list[int], query: str) -> dict:
     """
     Retrieve detailed chunks for specific projects from 'project_raw_docs'.
-    Returns {project_id: [chunk_texts]}.
+    Returns {project_id_str: [chunk_texts]}.
     """
     if not project_ids:
         return {}
         
     store = Config.get_milvus_store("project_raw_docs")
-    project_chunks = {pid: [] for pid in project_ids}
+    # Initialize with integer keys for processing
+    temp_chunks = {pid: [] for pid in project_ids}
     
     try:
         # We can't easily filter by list of IDs in standard similarity_search without expr.
@@ -236,26 +237,29 @@ def retrieve_project_chunks(project_ids: list[int], query: str) -> dict:
         
         for doc in docs:
             pid = doc.metadata.get("project_id")
-            if pid in project_chunks:
-                project_chunks[pid].append(doc.page_content)
+            if pid in temp_chunks:
+                temp_chunks[pid].append(doc.page_content)
                 
     except Exception as e:
         print(f"Error retrieving chunks: {e}")
-        
-    return project_chunks
+    
+    # Convert keys to strings for JSON serialization compatibility
+    final_chunks = {str(k): v for k, v in temp_chunks.items()}
+    return final_chunks
 
 @tool
 def retrieve_project_summary(project_ids: list[int], query: str) -> dict:
     """
     Retrieve summary/embedding chunks for specific projects from 'project_embeddings'.
-    Returns {project_id: [chunk_texts]}.
+    Returns {project_id_str: [chunk_texts]}.
     Fallback when raw docs are missing.
     """
     if not project_ids:
         return {}
         
     store = Config.get_milvus_store("project_embeddings")
-    project_chunks = {pid: [] for pid in project_ids}
+    # Initialize with integer keys for processing
+    temp_chunks = {pid: [] for pid in project_ids}
     
     try:
         expr = f"project_id in {project_ids}"
@@ -265,10 +269,12 @@ def retrieve_project_summary(project_ids: list[int], query: str) -> dict:
         for doc in docs:
             # Metadata might store ID as 'project_id' or 'id' depending on ingestion
             pid = doc.metadata.get("project_id") or doc.metadata.get("id")
-            if pid in project_chunks:
-                project_chunks[pid].append(doc.page_content)
+            if pid in temp_chunks:
+                temp_chunks[pid].append(doc.page_content)
                 
     except Exception as e:
         print(f"Error retrieving summaries: {e}")
         
-    return project_chunks
+    # Convert keys to strings for JSON serialization compatibility
+    final_chunks = {str(k): v for k, v in temp_chunks.items()}
+    return final_chunks

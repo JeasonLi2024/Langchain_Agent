@@ -9,12 +9,15 @@ import uuid
 # Add parent directory to sys.path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# Prioritize Local Env
+from core.config import Config
+
 # Initialize Django via core.django_setup
 from core.django_setup import setup_django
 setup_django()
 
-from typing import TypedDict, Annotated, List, Literal, Optional, Dict, Any
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage
+from typing_extensions import TypedDict, Annotated, List, Literal, Optional, Dict, Any
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langchain_core.prompts import ChatPromptTemplate
@@ -26,9 +29,9 @@ from core.embedding_service import generate_embedding, get_or_create_collection,
 from project.services import delete_requirement_vectors, sync_raw_docs_from_text
 from project.models import Requirement
 
-# Import custom PickleRedisSaver
-from core.persistence import PickleRedisSaver
-import redis
+# Import Postgres Saver
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from core.db import PostgresPool
 
 # --- 1. Define State ---
 class PublisherMasterState(TypedDict):
@@ -227,17 +230,43 @@ def chat_node(state: PublisherMasterState):
     llm = Config.get_utility_llm()
     messages = state["messages"]
     
+    # Sanitize messages to ensure content is string for ChatTongyi (doesn't support list/multimodal content)
+    sanitized_messages = []
+    for m in messages:
+        content = m.content
+        if isinstance(content, list):
+            # Extract text parts from multimodal content
+            text_parts = [
+                item.get('text', '') 
+                for item in content 
+                if isinstance(item, dict) and item.get('type') == 'text'
+            ]
+            content = " ".join(text_parts)
+            
+        # Reconstruct message with string content
+        if isinstance(m, HumanMessage):
+            sanitized_messages.append(HumanMessage(content=content))
+        elif isinstance(m, AIMessage):
+            sanitized_messages.append(AIMessage(content=content))
+        elif isinstance(m, SystemMessage):
+            sanitized_messages.append(SystemMessage(content=content))
+        elif isinstance(m, ToolMessage):
+            sanitized_messages.append(ToolMessage(content=content, tool_call_id=m.tool_call_id, name=m.name))
+        else:
+            # Fallback for other types
+            sanitized_messages.append(HumanMessage(content=str(content)))
+    
     prompt = ChatPromptTemplate.from_messages([
         ("system", PUBLISHER_CHAT_SYSTEM_PROMPT),
         ("placeholder", "{messages}")
     ])
     
     chain = prompt | llm
-    response = chain.invoke({"messages": messages})
+    response = chain.invoke({"messages": sanitized_messages})
     
     return {"messages": [response]}
 
-def file_parsing_node(state: PublisherMasterState):
+async def file_parsing_node(state: PublisherMasterState):
     """
     Handle file parsing.
     """
@@ -249,7 +278,7 @@ def file_parsing_node(state: PublisherMasterState):
         "file_name": original_filename,
     }
     
-    result = file_parsing_app.invoke(input_state)
+    result = await file_parsing_app.ainvoke(input_state)
     
     if result.get("success"):
         return {
@@ -265,7 +294,7 @@ def file_parsing_node(state: PublisherMasterState):
 
 from langchain_core.runnables import RunnableConfig
 
-def publisher_bridge_node(state: PublisherMasterState, config: RunnableConfig):
+async def publisher_bridge_node(state: PublisherMasterState, config: RunnableConfig):
     """
     Bridge to Publisher Agent.
     """
@@ -301,7 +330,7 @@ def publisher_bridge_node(state: PublisherMasterState, config: RunnableConfig):
         pass
 
     # Run Publisher Agent
-    result = publisher_app.invoke(publisher_inputs, config=config)
+    result = await publisher_app.ainvoke(publisher_inputs, config=config)
     
     # Capture output
     final_messages = result["messages"]
@@ -480,17 +509,11 @@ def check_sync(state: PublisherMasterState):
 workflow.add_conditional_edges("publisher_flow", check_sync, ["vector_sync", END])
 workflow.add_edge("vector_sync", END)
 
-# Setup Redis Checkpointer
-redis_host = Config.REDIS_HOST
-redis_port = Config.REDIS_PORT
-redis_db = Config.REDIS_DB
+# Setup Postgres Checkpointer
+# We use the global connection pool. 
+# Note: The pool must be opened (await pool.open()) by the server lifespan or script before use.
+# CRITICAL FIX: Same fix as main_agent.py - use MemorySaver for compilation placeholder.
+from langgraph.checkpoint.memory import MemorySaver
+checkpointer_placeholder = MemorySaver()
 
-try:
-    conn = redis.Redis(host=redis_host, port=redis_port, db=redis_db)
-    checkpointer = PickleRedisSaver(client=conn)
-except Exception as e:
-    print(f"Warning: Failed to initialize Redis checkpointer for Publisher: {e}. Fallback to MemorySaver.")
-    from langgraph.checkpoint.memory import MemorySaver
-    checkpointer = MemorySaver()
-
-publisher_main_app = workflow.compile(checkpointer=checkpointer)
+publisher_main_app = workflow.compile(checkpointer=checkpointer_placeholder)

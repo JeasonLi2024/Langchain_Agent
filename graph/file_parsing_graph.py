@@ -1,4 +1,4 @@
-from typing import TypedDict, List, Dict, Any, Annotated
+from typing_extensions import TypedDict, List, Dict, Any, Annotated
 import logging
 import os
 import re

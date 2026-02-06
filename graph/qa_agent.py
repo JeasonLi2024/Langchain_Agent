@@ -1,7 +1,7 @@
 import json
 import sys
 import os
-from typing import TypedDict, Annotated, List, Literal, Dict, Any
+from typing_extensions import TypedDict, Annotated, List, Literal, Dict, Any
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages

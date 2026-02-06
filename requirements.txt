@@ -1,23 +1,26 @@
 # Core Framework
-langchain>=0.2.0
-langchain-core>=0.2.0
-langchain-community>=0.2.0
-langgraph>=0.1.0
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-community>=0.3.0
+langgraph>=0.2.0
+langgraph-checkpoint>=2.0.0
+langgraph-checkpoint-postgres>=2.0.0
 
 # Vector Store
-langchain-milvus
+langchain-milvus>=0.1.0
 pymilvus
 
-# LLM & Embeddings Provider
+# LLM & Embeddings
 dashscope>=1.19.0
 openai
 
-# Database & Environment
+# Database & Async
+psycopg[binary,pool]>=3.2.0
 pymysql
 python-dotenv
-django>=4.2  # Required for model imports, though usually provided by host environment
+django>=4.2
 
-# Data Processing & Parsing
+# Data Processing
 numpy
 scikit-learn
 pypdf
@@ -30,4 +33,3 @@ fastapi
 uvicorn
 langserve
 sse-starlette
-
