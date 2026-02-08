@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import pymysql
 from langchain_core.tools import tool
 from core.config import Config
 
@@ -17,7 +18,7 @@ def search_projects_by_tags(interest_ids: list[int], skill_ids: list[int]) -> li
     candidates = {} # {project_id: {data, score}}
     
     try:
-        cursor = conn.cursor(dictionary=True)
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
         
         # 1. Search Interest Matches (Tag1)
         if interest_ids:
@@ -82,7 +83,7 @@ def search_projects_by_tags(interest_ids: list[int], skill_ids: list[int]) -> li
     return sorted_candidates[:20]
 
 @tool
-def search_projects_semantic(query: str) -> list[dict]:
+async def search_projects_semantic(query: str) -> list[dict]:
     """
     Track 2: Retrieve candidate projects based on Semantic Similarity (Fuzzy Match).
     Uses 'project_embeddings' collection.
@@ -93,7 +94,7 @@ def search_projects_semantic(query: str) -> list[dict]:
     
     try:
         # Search
-        docs = store.similarity_search_with_score(query, k=20)
+        docs = await store.asimilarity_search_with_score(query, k=20)
         
         project_ids = []
         for doc, score in docs:
@@ -109,7 +110,7 @@ def search_projects_semantic(query: str) -> list[dict]:
         # Fetch details from DB to fill title, status, etc.
         conn = Config.get_db_connection()
         try:
-            cursor = conn.cursor(dictionary=True)
+            cursor = conn.cursor(pymysql.cursors.DictCursor)
             format_strings = ','.join(['%s'] * len(project_ids))
             sql = f"""
                 SELECT id, title, status, description 
@@ -153,7 +154,7 @@ def search_projects_fulltext(keywords: list[str]) -> list[dict]:
     conn = Config.get_db_connection()
     results = []
     try:
-        cursor = conn.cursor(dictionary=True)
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
         # Prepare boolean query
         # e.g. "+keyword1 +keyword2" or just "keyword1 keyword2"
         search_query = " ".join(keywords) 
@@ -214,7 +215,7 @@ def search_projects_fulltext(keywords: list[str]) -> list[dict]:
     return results
 
 @tool
-def retrieve_project_chunks(project_ids: list[int], query: str) -> dict:
+async def retrieve_project_chunks(project_ids: list[int], query: str) -> dict:
     """
     Retrieve detailed chunks for specific projects from 'project_raw_docs'.
     Returns {project_id_str: [chunk_texts]}.
@@ -233,7 +234,7 @@ def retrieve_project_chunks(project_ids: list[int], query: str) -> dict:
         
         expr = f"project_id in {project_ids}"
         # Search
-        docs = store.similarity_search(query, k=50, expr=expr)
+        docs = await store.asimilarity_search(query, k=50, expr=expr)
         
         for doc in docs:
             pid = doc.metadata.get("project_id")
@@ -248,7 +249,7 @@ def retrieve_project_chunks(project_ids: list[int], query: str) -> dict:
     return final_chunks
 
 @tool
-def retrieve_project_summary(project_ids: list[int], query: str) -> dict:
+async def retrieve_project_summary(project_ids: list[int], query: str) -> dict:
     """
     Retrieve summary/embedding chunks for specific projects from 'project_embeddings'.
     Returns {project_id_str: [chunk_texts]}.
@@ -264,7 +265,7 @@ def retrieve_project_summary(project_ids: list[int], query: str) -> dict:
     try:
         expr = f"project_id in {project_ids}"
         # Search
-        docs = store.similarity_search(query, k=10, expr=expr)
+        docs = await store.asimilarity_search(query, k=10, expr=expr)
         
         for doc in docs:
             # Metadata might store ID as 'project_id' or 'id' depending on ingestion

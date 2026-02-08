@@ -50,6 +50,9 @@ async def lifespan(app: FastAPI):
     
     # 2. Swap for Publisher Agent
     publisher_agent.checkpointer = real_checkpointer
+
+    # 3. Swap for QA Agent
+    qa_agent.checkpointer = real_checkpointer
     
     print("Swapped In-Memory Checkpointers with AsyncPostgresSaver.")
     
@@ -165,6 +168,15 @@ add_routes(
     app,
     publisher_agent,
     path="/publisher",
+    playground_type="default",
+    per_req_config_modifier=per_req_config_modifier,
+)
+
+# QA Agent Endpoint
+add_routes(
+    app,
+    qa_agent,
+    path="/qa",
     playground_type="default",
     per_req_config_modifier=per_req_config_modifier,
 )

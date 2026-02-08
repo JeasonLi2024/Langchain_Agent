@@ -105,10 +105,17 @@ class Config:
 
     @classmethod
     def get_milvus_store(cls, collection_name):
+        # Determine text field based on collection
+        if collection_name in ["student_interests", "student_skills"]:
+            text_field = "text"
+        else:
+            text_field = "content"
+            
         return Milvus(
             embedding_function=cls.get_embeddings(),
             connection_args={"host": cls.MILVUS_HOST, "port": cls.MILVUS_PORT},
-            collection_name=collection_name
+            collection_name=collection_name,
+            text_field=text_field
         )
 
     @classmethod
