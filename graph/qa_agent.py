@@ -38,7 +38,7 @@ class QAState(TypedDict):
 
 from langchain_core.runnables import RunnableConfig
 
-def qa_node(state: QAState, config: RunnableConfig):
+async def qa_node(state: QAState, config: RunnableConfig):
     """
     Standalone QA Node for specific projects.
     Retrieves chunks from Milvus (Raw Docs -> Embeddings fallback) and answers questions.
@@ -83,7 +83,7 @@ def qa_node(state: QAState, config: RunnableConfig):
             Standalone question:
         """)
         try:
-            res = (condense_prompt | llm).invoke({
+            res = await (condense_prompt | llm).ainvoke({
                 "chat_history": history_str, 
                 "question": last_question
             })
@@ -95,20 +95,21 @@ def qa_node(state: QAState, config: RunnableConfig):
     # Strategy: Try Raw Docs -> If empty -> Try Embeddings (Summary)
     
     # A. Search Raw Docs
-    context_chunks = retrieve_project_chunks.invoke({
+    context_chunks = await retrieve_project_chunks.ainvoke({
         "project_ids": [target_id],
         "query": standalone_question
     })
-    chunks_list = context_chunks.get(target_id, []) if context_chunks else []
+    # Note: tools return keys as strings for JSON compatibility
+    chunks_list = context_chunks.get(str(target_id), []) if context_chunks else []
     source = "Detailed Documents"
     
     # B. Fallback to Embeddings
     if not chunks_list:
-        summary_chunks = retrieve_project_summary.invoke({
+        summary_chunks = await retrieve_project_summary.ainvoke({
             "project_ids": [target_id],
             "query": standalone_question
         })
-        chunks_list = summary_chunks.get(target_id, []) if summary_chunks else []
+        chunks_list = summary_chunks.get(str(target_id), []) if summary_chunks else []
         source = "Project Summary"
     
     context_text = "\n\n".join(chunks_list)
@@ -127,11 +128,16 @@ def qa_node(state: QAState, config: RunnableConfig):
     """
     
     chain = ChatPromptTemplate.from_template(qa_prompt) | llm
-    response = chain.invoke({
-        "target_id": target_id,
-        "context": f"Source: {source}\n\n{context_text}",
-        "question": full_question_context
-    }, config=config)
+    try:
+        response = await chain.ainvoke({
+            "target_id": target_id,
+            "context": f"Source: {source}\n\n{context_text}",
+            "question": full_question_context
+        }, config=config)
+    except Exception as e:
+        print(f"Error in QA generation: {e}")
+        # Return a fallback message
+        response = AIMessage(content="抱歉，生成回答时出现错误。请稍后再试。")
     
     return {"messages": [response]}
 

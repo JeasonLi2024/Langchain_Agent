@@ -127,11 +127,13 @@ async def router_node(state: PublisherMasterState):
     original_filename = state.get("original_filename")
     messages = state["messages"]
     new_file_uploaded = False
+    cover_url = None # Initialize to avoid UnboundLocalError
     
     # Check for multimodal message with file data in the last message
     if messages and isinstance(messages[-1].content, list):
         for item in messages[-1].content:
-            if isinstance(item, dict) and (item.get('type') == 'file' or item.get('type') == 'image_url'): # Check for image_url too as some UIs use it for files
+            # Update: Support 'image' type which is used by some frontends (e.g. user input)
+            if isinstance(item, dict) and (item.get('type') == 'file' or item.get('type') == 'image_url' or item.get('type') == 'image'): 
                 # Found a file upload!
                 file_data_b64 = item.get('data') or item.get('content') # Support 'content' key too
                 
@@ -266,7 +268,12 @@ async def router_node(state: PublisherMasterState):
             last_msg = messages[-1].content
         elif isinstance(messages[-1].content, list):
             # Extract text from multimodal
-            text_parts = [item.get('text', '') for item in messages[-1].content if item.get('type') == 'text']
+            text_parts = []
+            for item in messages[-1].content:
+                if item.get('type') == 'text':
+                    text_parts.append(item.get('text', ''))
+                elif item.get('type') == 'image_url' or item.get('type') == 'image':
+                     text_parts.append("[User uploaded an image]")
             last_msg = " ".join(text_parts)
     
     # Handle Image Uploads specifically (Bypass parsing, inject system info)
@@ -343,15 +350,21 @@ def chat_node(state: PublisherMasterState):
     for m in messages:
         content = m.content
         if isinstance(content, list):
-            # Extract text parts from multimodal content
-            text_parts = []
+            # Preserve multimodal content for models that support it
+            new_content = []
             for item in content:
                 if isinstance(item, dict):
                     if item.get('type') == 'text':
-                        text_parts.append(item.get('text', ''))
-                    elif item.get('type') == 'image_url' or item.get('type') == 'file':
-                        text_parts.append("[User uploaded an image]")
-            content = " ".join(text_parts)
+                        new_content.append(item)
+                    elif item.get('type') == 'image_url':
+                        new_content.append(item)
+                    elif item.get('type') == 'file' or item.get('type') == 'image':
+                         new_content.append({"type": "text", "text": "[User uploaded an image]"})
+            
+            if new_content:
+                content = new_content
+            else:
+                content = "" # Handle empty case
             
         # Reconstruct message with string content
         if isinstance(m, HumanMessage):

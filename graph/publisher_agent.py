@@ -127,16 +127,15 @@ def save_requirement(
             req.description += extra_info
 
         # Update Tags
-        # NOTE: We DO NOT suppress signals here.
-        # For simple metadata updates via tool calls, we rely on the Backend's standard Celery tasks
-        # to handle vector synchronization. This ensures consistency for text-only updates.
-        # The 'suppress_signals' logic is only used in publisher_main_agent.py for bulk file ingestion.
+        # NOTE: Signals are suppressed by the parent graph (publisher_main_agent.py).
+        # We must handle vector synchronization manually here to ensure data consistency.
+        # This applies to both file uploads (handled in parent) and chat-only updates (handled here).
         
         # Handle Cover Image Persistence
         # Check if cover_image_url indicates a temporary file (either in cover/tmp or generic tmp)
+        import os  # Import os here to avoid UnboundLocalError
         if cover_image_url and ("cover/tmp/" in cover_image_url or "/tmp/" in cover_image_url or "upload_" in os.path.basename(cover_image_url)):
             try:
-                import os
                 import shutil
                 from django.conf import settings
                 from datetime import datetime
@@ -227,6 +226,18 @@ def save_requirement(
         if tag2_ids:
             req.tag2.set(tag2_ids)
             
+        # Manual Vector Sync Trigger
+        # Ensure vectorization happens even if Celery tasks are not running or fail
+        if status == 'under_review':
+            try:
+                from project.services import sync_requirement_vectors, sync_raw_docs_auto
+                print(f"Triggering manual vector sync for Requirement {req.id}...")
+                sync_requirement_vectors(req)
+                sync_raw_docs_auto(req)
+                print(f"Manual vector sync completed for Requirement {req.id}.")
+            except Exception as e:
+                print(f"Error in manual vector sync: {e}")
+
         action = "Published" if status == 'under_review' else "Draft Saved"
         return f"{action} successfully. ID: {req.id}"
         
@@ -392,7 +403,7 @@ async def chat_node(state: PublisherState, config: RunnableConfig):
     # Inject Cover Image Context if available
     cover_image_path = state.get("cover_image_path")
     if cover_image_path:
-        system_msg += f"\n\n【重要提示】检测到用户上传了封面图片文件：{cover_image_path}。如果用户确认使用该图片作为封面，请在调用 `save_requirement` 时将 `cover_image_url` 参数设置为此路径。"
+        system_msg += f"\n\n【重要提示】检测到用户上传了封面图片：{cover_image_path}。\n请务必在回复中向用户展示这张图片（使用Markdown图片语法 `![]({cover_image_path})`），并询问用户是否确认使用该图片作为封面。\n如果用户确认，请在调用 `save_requirement` 时将 `cover_image_url` 参数设置为此路径。"
 
     # Dynamic Prompt Injection: Force Tool Call if user asks for recommendation
     last_human_msg = ""
@@ -421,7 +432,12 @@ async def chat_node(state: PublisherState, config: RunnableConfig):
         any(word in last_human_msg for word in affirmative_words)
     )
 
-    if user_asks_directly or user_confirms:
+    # Prevent infinite loop: if we just ran the tool, don't force it again
+    just_ran_recommend_tags = False
+    if messages and isinstance(messages[-1], ToolMessage) and messages[-1].name == 'recommend_tags':
+        just_ran_recommend_tags = True
+
+    if (user_asks_directly or user_confirms) and not just_ran_recommend_tags:
         system_msg += "\n\n【重要指令】用户正在请求或同意标签推荐。请务必调用 `recommend_tags` 工具，**不要**直接在文本中回复标签。"
         # Force tool usage if supported by the LLM provider
         # llm_with_tools = llm.bind_tools([save_requirement, recommend_tags], tool_choice="recommend_tags")
@@ -438,16 +454,27 @@ async def chat_node(state: PublisherState, config: RunnableConfig):
     for m in messages:
         content = m.content
         if isinstance(content, list):
-             # Flatten multimodal content to text
-             text_parts = []
+             # Preserve multimodal content for models that support it (e.g. Qwen-VL, GPT-4o)
+             new_content = []
              for item in content:
                  if isinstance(item, dict):
-                     if item.get('type') == 'text':
-                         text_parts.append(item.get('text', ''))
-                     elif item.get('type') == 'image_url' or item.get('type') == 'file':
-                         text_parts.append("[User uploaded an image]")
+                    if item.get('type') == 'text':
+                        new_content.append(item)
+                    elif item.get('type') == 'image_url':
+                        # Preserve image_url
+                        new_content.append(item)
+                        # Add a system hint so the agent knows this is likely a cover image candidate
+                        new_content.append({"type": "text", "text": "[System: User has uploaded this image. You should acknowledge it and ask if they want to use it as the project cover.]"})
+                    elif item.get('type') == 'image':
+                        # Convert raw image to text placeholder
+                        new_content.append({"type": "text", "text": "[System: User has uploaded an image. You should acknowledge it and ask if they want to use it as the project cover.]"})
+                    elif item.get('type') == 'file':
+                        new_content.append({"type": "text", "text": "[System: User has uploaded a file attachment.]"})
              
-             content = " ".join(text_parts)
+             if new_content:
+                 content = new_content
+             else:
+                 content = "" # Handle empty case
 
         if m.type == 'human':
             sanitized_messages.append(HumanMessage(content=content))

@@ -18,6 +18,7 @@ def search_projects_by_tags(interest_ids: list[int], skill_ids: list[int]) -> li
     candidates = {} # {project_id: {data, score}}
     
     try:
+        # Standard pymysql connection, pass cursor class as argument
         cursor = conn.cursor(pymysql.cursors.DictCursor)
         
         # 1. Search Interest Matches (Tag1)
@@ -110,6 +111,7 @@ async def search_projects_semantic(query: str) -> list[dict]:
         # Fetch details from DB to fill title, status, etc.
         conn = Config.get_db_connection()
         try:
+            # Standard pymysql connection, pass cursor class as argument
             cursor = conn.cursor(pymysql.cursors.DictCursor)
             format_strings = ','.join(['%s'] * len(project_ids))
             sql = f"""
@@ -154,6 +156,7 @@ def search_projects_fulltext(keywords: list[str]) -> list[dict]:
     conn = Config.get_db_connection()
     results = []
     try:
+        # Standard pymysql connection, pass cursor class as argument
         cursor = conn.cursor(pymysql.cursors.DictCursor)
         # Prepare boolean query
         # e.g. "+keyword1 +keyword2" or just "keyword1 keyword2"
@@ -243,6 +246,9 @@ async def retrieve_project_chunks(project_ids: list[int], query: str) -> dict:
                 
     except Exception as e:
         print(f"Error retrieving chunks: {e}")
+        # Explicitly handle NotImplementedError or others that might cause serialization issues
+        if isinstance(e, NotImplementedError):
+             print("Swallowed NotImplementedError in retrieve_project_chunks")
     
     # Convert keys to strings for JSON serialization compatibility
     final_chunks = {str(k): v for k, v in temp_chunks.items()}
@@ -275,6 +281,9 @@ async def retrieve_project_summary(project_ids: list[int], query: str) -> dict:
                 
     except Exception as e:
         print(f"Error retrieving summaries: {e}")
+        # Explicitly handle NotImplementedError
+        if isinstance(e, NotImplementedError):
+             print("Swallowed NotImplementedError in retrieve_project_summary")
         
     # Convert keys to strings for JSON serialization compatibility
     final_chunks = {str(k): v for k, v in temp_chunks.items()}
