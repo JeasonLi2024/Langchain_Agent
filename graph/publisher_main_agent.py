@@ -6,6 +6,9 @@ import base64
 import tempfile
 import uuid
 
+import re
+import traceback
+
 # Add parent directory to sys.path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -28,12 +31,44 @@ from graph.file_parsing_graph import file_parsing_app
 from core.embedding_service import generate_embedding, get_or_create_collection, COLLECTION_EMBEDDINGS, COLLECTION_RAW_DOCS
 from project.services import delete_requirement_vectors, sync_raw_docs_from_text
 from project.models import Requirement
+from project.signals import handle_requirement_save, handle_files_change, handle_tags_change
+from django.db.models.signals import post_save, m2m_changed
+from contextlib import contextmanager
+
+@contextmanager
+def suppress_signals():
+    """
+    Temporarily disconnect Django signals to prevent automatic Celery tasks 
+    from overwriting our manual vector sync.
+    """
+    try:
+        post_save.disconnect(handle_requirement_save, sender=Requirement)
+        m2m_changed.disconnect(handle_files_change, sender=Requirement.files.through)
+        m2m_changed.disconnect(handle_tags_change, sender=Requirement.tag1.through)
+        m2m_changed.disconnect(handle_tags_change, sender=Requirement.tag2.through)
+        yield
+    finally:
+        post_save.connect(handle_requirement_save, sender=Requirement)
+        m2m_changed.connect(handle_files_change, sender=Requirement.files.through)
+        m2m_changed.connect(handle_tags_change, sender=Requirement.tag1.through)
+        m2m_changed.connect(handle_tags_change, sender=Requirement.tag2.through)
 
 # Import Postgres Saver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from core.db import PostgresPool
 
 # --- 1. Define State ---
+
+class PublisherInputState(TypedDict):
+    """
+    Input schema for the graph.
+    Only allows messages and user_info to be passed in, preventing
+    accidental overwrites of internal state (file_path, parsed_data) 
+    by clients sending empty defaults.
+    """
+    messages: List[BaseMessage]
+    user_info: Optional[dict]
+
 class PublisherMasterState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     next_step: str
@@ -41,6 +76,7 @@ class PublisherMasterState(TypedDict):
     
     # Publisher Context
     file_path: Optional[str] # If user uploaded a file
+    cover_image_path: Optional[str] # If user uploaded a cover image
     original_filename: Optional[str] # If user uploaded a file, keep the original name
     parsed_file_data: Optional[dict] # Data from file_parsing_graph
     publisher_state: Optional[dict] # State returned from publisher_agent
@@ -123,6 +159,13 @@ async def router_node(state: PublisherMasterState):
                                 ext = ".doc"
                             elif decoded_data.startswith(b'PK\x03\x04'): # DOCX/ZIP
                                 ext = ".docx"
+                            elif 'image' in mime_type:
+                                if 'png' in mime_type:
+                                    ext = ".png"
+                                elif 'jpeg' in mime_type or 'jpg' in mime_type:
+                                    ext = ".jpg"
+                                else:
+                                    ext = ".jpg" # Default image
                                 
                             temp_filename = f"upload_{uuid.uuid4()}{ext}"
                             temp_path = os.path.join(tmp_dir, temp_filename)
@@ -178,6 +221,12 @@ async def router_node(state: PublisherMasterState):
                             new_file_uploaded = True
                             print(f"File uploaded: {original_filename} saved to: {file_path}") # Log for debugging
                             
+                            # Check if it is an image
+                            is_image = False
+                            lower_name = original_filename.lower()
+                            if lower_name.endswith('.png') or lower_name.endswith('.jpg') or lower_name.endswith('.jpeg') or 'image' in mime_type:
+                                is_image = True
+                            
                     except Exception as e:
                         print(f"Error decoding file: {e}")
 
@@ -190,7 +239,35 @@ async def router_node(state: PublisherMasterState):
             text_parts = [item.get('text', '') for item in messages[-1].content if item.get('type') == 'text']
             last_msg = " ".join(text_parts)
     
-    # Priority 1: File Upload -> Parsing
+    # Handle Image Uploads specifically (Bypass parsing, inject system info)
+    if new_file_uploaded and is_image:
+        # Inject a system message to inform the agent about the file
+        # We append it to the messages list in the state update (returned dict)
+        # But we can't easily modify 'messages' here without returning it.
+        # So we return it in the result.
+        
+        # We need to construct a message that the agent can see.
+        # Since we are in a router, we return state updates.
+        sys_msg = SystemMessage(content=f"User uploaded an image file: {original_filename}. Saved at: {file_path}. Use this path if the user wants to set it as cover.")
+        
+        # Check if we are in publisher flow
+        publisher_state = state.get("publisher_state", {})
+        if publisher_state and not publisher_state.get("is_complete", False):
+             return {
+                 "next_step": "publisher_flow", 
+                 "messages": [sys_msg],
+                 "cover_image_path": file_path 
+             }
+        else:
+             # Default to chat or publisher based on intent, but skip parsing
+             # If it's just an image, maybe we start publisher flow?
+             return {
+                 "next_step": "publisher_flow",
+                 "messages": [sys_msg],
+                 "cover_image_path": file_path
+             }
+
+    # Priority 1: File Upload -> Parsing (Only for non-images)
     # Only route to parsing if it's a NEW file or we have a file but no parsed data yet
     if new_file_uploaded or (file_path and not state.get("parsed_file_data")):
         return {"next_step": "file_parsing_flow", "file_path": file_path, "original_filename": original_filename}
@@ -294,6 +371,8 @@ async def file_parsing_node(state: PublisherMasterState):
 
 from langchain_core.runnables import RunnableConfig
 
+from asgiref.sync import sync_to_async
+
 async def publisher_bridge_node(state: PublisherMasterState, config: RunnableConfig):
     """
     Bridge to Publisher Agent.
@@ -313,7 +392,8 @@ async def publisher_bridge_node(state: PublisherMasterState, config: RunnableCon
         "suggested_tags": {},
         "selected_tags": {},
         "next_step": "",
-        "is_complete": False
+        "is_complete": False,
+        "cover_image_path": state.get("cover_image_path") # Pass cover image path
     }
     
     # Inject Parsed Data if available and first run (no draft data yet)
@@ -330,10 +410,23 @@ async def publisher_bridge_node(state: PublisherMasterState, config: RunnableCon
         pass
 
     # Run Publisher Agent
-    result = await publisher_app.ainvoke(publisher_inputs, config=config)
+    # Suppress signals to prevent automatic vector sync from interfering with manual sync
+    with suppress_signals():
+        result = await publisher_app.ainvoke(publisher_inputs, config=config)
     
     # Capture output
     final_messages = result["messages"]
+    
+    # Calculate new messages to return to Master Graph
+    # We filter out messages that were already in the input
+    input_len = len(messages)
+    new_messages = final_messages[input_len:]
+    
+    # Fallback: If for some reason new_messages is empty but result has messages (e.g. logic change),
+    # ensure we return at least the last one.
+    if not new_messages and final_messages:
+        new_messages = [final_messages[-1]]
+        
     last_msg = final_messages[-1]
     
     # Detect if Requirement was Saved/Published
@@ -344,89 +437,181 @@ async def publisher_bridge_node(state: PublisherMasterState, config: RunnableCon
     # We look at the last few messages
     for m in reversed(final_messages):
         if isinstance(m, ToolMessage) and m.name == "save_requirement":
-            if "ID:" in m.content:
+            # Robust ID extraction using regex
+            # Matches "ID: 123" or "ID:123" or "ID: 123."
+            match = re.search(r"ID:\s*(\d+)", m.content)
+            if match:
                 try:
-                    new_req_id = int(m.content.split("ID:")[1].strip())
+                    new_req_id = int(match.group(1))
                     # Retrieve the actual requirement to get full data for vector sync
                     try:
-                        req = Requirement.objects.get(id=new_req_id)
-                        tags1 = [t.value for t in req.tag1.all()]
-                        tags2 = [t.post for t in req.tag2.all()]
-                        final_req_data = {
-                            "id": req.id,
-                            "title": req.title,
-                            "description": req.description, # Already contains research/skill appended
-                            "tags": tags1 + tags2,
-                            "status": req.status
-                        }
-                    except:
-                        pass
-                except:
-                    pass
+                        # Wrap sync DB call
+                        @sync_to_async
+                        def get_req_details(req_id):
+                            req = Requirement.objects.get(id=req_id)
+                            tags1 = [t.value for t in req.tag1.all()]
+                            tags2 = [t.post for t in req.tag2.all()]
+                            return {
+                                "id": req.id,
+                                "title": req.title,
+                                "description": req.description,
+                                "tags": tags1 + tags2,
+                                "status": req.status
+                            }
+                        
+                        final_req_data = await get_req_details(new_req_id)
+                    except Exception as e:
+                        print(f"Error retrieving requirement details: {e}")
+                except Exception as e:
+                    print(f"Error parsing requirement ID: {e}")
             break
             
     # === Handle File Attachment and Cleanup ===
     import shutil
     from project.models import File
+    from project.services import delete_requirement_vectors, get_or_create_collection, COLLECTION_RAW_DOCS, COLLECTION_EMBEDDINGS, generate_embedding
     
     file_path = state.get("file_path")
     original_name = state.get("original_filename", "document.pdf")
     
+    # Debug info
+    if file_path:
+        print(f"Checking file attachment: ReqID={new_req_id}, File={file_path}, Exists={os.path.exists(file_path)}")
+    
     # Only proceed if we have a valid requirement ID and a file path
     if new_req_id and file_path and os.path.exists(file_path):
         try:
-            # 1. Define target path
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            # IMPORTANT: Ensure this path matches your server configuration (e.g. /home/bupt/Server_Project_ZH/media/...)
-            # If running on server where Server_Project_ZH is separate, adjust accordingly or use relative to current script if possible.
-            # Assuming 'static' or 'media' dir in project root. User mentioned '/home/bupt/Server_Project_ZH/media/uploads/files/requirements'
-            # We will use 'static' as per previous code, but note user input mentioned 'media'.
-            # For consistency with previous 'static' usage in this file, we stick to 'static' but add robustness.
-            # If user wants media, we should change 'static' to 'media'. 
-            # Let's use 'media' as requested in user prompt "Server_Project_ZH/media/uploads/files/requirements" (approx).
-            # User said: "/home/bupt/Server_Project_ZH/media/uploads/files/requirements"
-            # But previous code used "static". I will use "media" to align with user request 3.
-            
-            # Adjust to user request: /home/bupt/Server_Project_ZH/media/uploads/files/requirement
-            SERVER_PROJECT_ROOT = "/home/bupt/Server_Project_ZH"
-            media_root = os.path.join(SERVER_PROJECT_ROOT, "media")
-            target_dir = os.path.join(media_root, "uploads", "files", "requirement")
-            os.makedirs(target_dir, exist_ok=True)
+            # 1. Define target path using Django MEDIA_ROOT
+            from django.conf import settings
             
             # 2. Generate new unique filename
             ext = os.path.splitext(original_name)[1]
             new_filename = f"{uuid.uuid4().hex}{ext}"
-            target_path = os.path.join(target_dir, new_filename)
             
-            # 3. Move file (this also removes it from tmp)
-            # shutil.move handles cross-device moves by copy+delete
+            # Construct relative path (e.g., "files/requirement/uuid.pdf")
+            relative_path = f"uploads/files/requirement/{new_filename}"
+            
+            # Absolute path in Django's Media directory
+            target_path = os.path.join(settings.MEDIA_ROOT, relative_path)
+            
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            
+            # 3. Move file
             shutil.move(file_path, target_path)
             
-            # 4. Create File model record
-            # URL should correspond to how media is served. Usually /media/...
-            file_url = f"/media/uploads/files/requirement/{new_filename}"
+            # 4. Create File Object
+            # Construct URL relative to MEDIA_URL
+            file_url = f"{settings.MEDIA_URL}{relative_path}"
             file_size = os.path.getsize(target_path)
             
             # real_path should be relative to MEDIA_ROOT for portability and consistency with Django FileField
             relative_path = f"uploads/files/requirement/{new_filename}"
             
-            file_obj = File.objects.create(
-                name=original_name,
-                url=file_url,
-                path=f"/需求附件/{original_name}", # Virtual path
-                real_path=relative_path, # Storing relative path
-                is_folder=False,
-                size=file_size
+            # Wrap sync DB creation
+            @sync_to_async
+            def create_and_link_file(req_id, name, url, path, real_path, size):
+                # Suppress signals here too
+                with suppress_signals():
+                    file_obj = File.objects.create(
+                        name=name,
+                        url=url,
+                        path=path,
+                        real_path=real_path,
+                        is_folder=False,
+                        size=size
+                    )
+                    req = Requirement.objects.get(id=req_id)
+                    req.files.add(file_obj)
+                    return file_obj
+
+            await create_and_link_file(
+                new_req_id,
+                original_name,
+                file_url,
+                f"/需求附件/{original_name}",
+                relative_path,
+                file_size
             )
-            
-            # 5. Link to Requirement
-            req = Requirement.objects.get(id=new_req_id)
-            req.files.add(file_obj)
             
             print(f"File attached to Requirement {new_req_id}: {target_path}")
             
+            # === Manual Vector Sync (Agent-Driven Persistence) ===
+            # Ensure consistency by using the EXACT chunks parsed by the Agent
+            if parsed_data:
+                chunks = parsed_data.get("chunks", [])
+                embeddings = parsed_data.get("chunk_embeddings", [])
+                print(f"Executing Agent-Driven Vector Sync for Req {new_req_id}...")
+                print(f"Parsed Data: Chunks={len(chunks)}, Embeddings={len(embeddings)}")
+                
+                # 1. Sync Raw Docs (Chunks)
+                if chunks and embeddings and len(chunks) == len(embeddings):
+                    try:
+                        # Clear potential backend fallback data first
+                        delete_requirement_vectors(new_req_id, [COLLECTION_RAW_DOCS])
+                        
+                        collection = get_or_create_collection(COLLECTION_RAW_DOCS)
+                        pids = [new_req_id] * len(chunks)
+                        # Filter valid embeddings
+                        valid_data = [(p, v, c, i) for i, (p, v, c) in enumerate(zip(pids, embeddings, chunks)) if v and len(v) > 0]
+                        
+                        if valid_data:
+                            data_insert = [
+                                [x[0] for x in valid_data], # pids
+                                [x[1] for x in valid_data], # vectors
+                                [x[2][:65535] for x in valid_data], # content
+                                [x[3] for x in valid_data]  # indices
+                            ]
+                            collection.insert(data_insert)
+                            collection.flush()
+                            print(f"Successfully inserted {len(valid_data)} chunks into {COLLECTION_RAW_DOCS}")
+                    except Exception as e:
+                        print(f"Error in manual raw docs sync: {e}")
+                
+                # 2. Sync Semantic Embedding (Project)
+                # Use data from final_req_data (which has Tags)
+                if final_req_data:
+                    try:
+                        title = final_req_data.get("title", "")
+                        desc = final_req_data.get("description", "")
+                        tags = final_req_data.get("tags", [])
+                        # Brief might be missing in final_req_data dict, retrieve from draft_data or empty
+                        brief = publisher_state.get("draft_data", {}).get("brief", "")
+                        
+                        full_text = f"Title: {title}\nBrief: {brief}\nDescription: {desc}\nTags: {', '.join(tags)}"
+                        
+                        vector = generate_embedding(full_text)
+                        
+                        if vector:
+                            delete_requirement_vectors(new_req_id, [COLLECTION_EMBEDDINGS])
+                            collection_emb = get_or_create_collection(COLLECTION_EMBEDDINGS)
+                            data_emb = [
+                                [new_req_id],
+                                [vector],
+                                [full_text[:65535]]
+                            ]
+                            collection_emb.insert(data_emb)
+                            collection_emb.flush()
+                            print(f"Successfully inserted semantic embedding into {COLLECTION_EMBEDDINGS}")
+                    except Exception as e:
+                        print(f"Error in manual semantic sync: {e}")
+                        # If schema mismatch, try to recover (in dev/test env only)
+                        if "schema" in str(e).lower() or "match" in str(e).lower():
+                             print("Attempting to fix schema mismatch by dropping collection...")
+                             try:
+                                 from pymilvus import utility
+                                 utility.drop_collection(COLLECTION_EMBEDDINGS)
+                                 print(f"Dropped {COLLECTION_EMBEDDINGS}, retrying insert...")
+                                 collection_emb = get_or_create_collection(COLLECTION_EMBEDDINGS)
+                                 collection_emb.insert(data_emb)
+                                 collection_emb.flush()
+                                 print(f"Retry successful.")
+                             except Exception as retry_e:
+                                 print(f"Retry failed: {retry_e}")
+
         except Exception as e:
             print(f"Error attaching file: {e}")
+            traceback.print_exc()
         finally:
             # Ensure tmp file is cleaned up even if move failed (or if move was copy+delete and failed mid-way)
             if os.path.exists(file_path):
@@ -439,8 +624,11 @@ async def publisher_bridge_node(state: PublisherMasterState, config: RunnableCon
     # elif file_path and os.path.exists(file_path):
     #     ...
 
+    # Check for stale files cleanup on each run (simple implementation)
+    cleanup_stale_files()
+
     return {
-        "messages": [last_msg],
+        "messages": new_messages,
         "publisher_state": result,
         "final_requirement_id": new_req_id,
         "final_requirement_data": final_req_data,
@@ -474,7 +662,7 @@ def vector_sync_node(state: PublisherMasterState):
 # from langgraph.checkpoint.memory import MemorySaver
 
 # --- 3. Build Graph ---
-workflow = StateGraph(PublisherMasterState)
+workflow = StateGraph(PublisherMasterState, input=PublisherInputState)
 
 workflow.add_node("router", router_node)
 workflow.add_node("chat_node", chat_node)
@@ -512,8 +700,6 @@ workflow.add_edge("vector_sync", END)
 # Setup Postgres Checkpointer
 # We use the global connection pool. 
 # Note: The pool must be opened (await pool.open()) by the server lifespan or script before use.
-# CRITICAL FIX: Same fix as main_agent.py - use MemorySaver for compilation placeholder.
-from langgraph.checkpoint.memory import MemorySaver
-checkpointer_placeholder = MemorySaver()
-
-publisher_main_app = workflow.compile(checkpointer=checkpointer_placeholder)
+# For LangGraph API compatibility, we do not set checkpointer here.
+# It will be injected by server.py (for local prod) or LangGraph Platform (for dev).
+publisher_main_app = workflow.compile()

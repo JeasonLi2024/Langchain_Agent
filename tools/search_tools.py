@@ -22,7 +22,7 @@ def extract_keywords(user_input: str) -> list[str]:
         return [user_input]
 
 @tool
-def retrieve_tags(queries: list[str]) -> dict:
+async def retrieve_tags(queries: list[str]) -> dict:
     """Retrieve relevant interest and skill tags from Milvus based on queries."""
     interest_store = Config.get_milvus_store("student_interests")
     skill_store = Config.get_milvus_store("student_skills")
@@ -33,14 +33,14 @@ def retrieve_tags(queries: list[str]) -> dict:
     for q in queries:
         try:
             # Interest Search
-            docs_int = interest_store.similarity_search_with_score(q, k=5)
+            docs_int = await interest_store.asimilarity_search_with_score(q, k=5)
             for doc, score in docs_int:
                 doc_id = doc.metadata.get('id')
                 if doc_id not in interest_results:
                     interest_results[doc_id] = (doc, score)
             
             # Skill Search
-            docs_skill = skill_store.similarity_search_with_score(q, k=5)
+            docs_skill = await skill_store.asimilarity_search_with_score(q, k=5)
             for doc, score in docs_skill:
                 doc_id = doc.metadata.get('id')
                 if doc_id not in skill_results:
@@ -98,7 +98,7 @@ def retrieve_tags(queries: list[str]) -> dict:
     }
 
 @tool
-def retrieve_project_details(query: str) -> str:
+async def retrieve_project_details(query: str) -> str:
     """
     Retrieve project details from Milvus (project_raw_docs) based on query.
     IMPORTANT: Performs strict status filtering to exclude draft/private projects.
@@ -106,7 +106,7 @@ def retrieve_project_details(query: str) -> str:
     try:
         store = Config.get_milvus_store("project_raw_docs")
         # Search more candidates to allow for filtering
-        docs = store.similarity_search_with_score(query, k=20)
+        docs = await store.asimilarity_search_with_score(query, k=20)
         
         if not docs:
             return "No relevant project details found."

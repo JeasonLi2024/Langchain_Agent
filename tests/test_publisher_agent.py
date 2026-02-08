@@ -60,6 +60,8 @@ from langchain_core.messages import HumanMessage, AIMessage
 
 User = get_user_model()
 
+from asgiref.sync import async_to_sync
+
 def test_publisher_agent():
     print("Setting up test data...")
     # Create User
@@ -100,7 +102,7 @@ def test_publisher_agent():
     
     # Run 1
     print("\n--- Round 1 ---")
-    result = publisher_app.invoke(state)
+    result = async_to_sync(publisher_app.ainvoke)(state)
     last_msg = result['messages'][-1]
     print(f"Agent: {last_msg.content}")
     
@@ -110,7 +112,7 @@ def test_publisher_agent():
     new_messages = result['messages'] + [HumanMessage(content=user_input)]
     state['messages'] = new_messages
     
-    result = publisher_app.invoke(state)
+    result = async_to_sync(publisher_app.ainvoke)(state)
     
     # Check if tool was called (save_draft)
     # The result should contain the tool call message and the tool output message if the graph executed the tool.
@@ -132,10 +134,6 @@ def test_publisher_agent():
         print(f"Description: {req.description}")
     else:
         print("\nFAILURE: Requirement not created.")
-
-    # Clean up
-    # user.delete()
-    # org.delete()
 
 if __name__ == "__main__":
     test_publisher_agent()

@@ -412,79 +412,9 @@ pool = PostgresPool.get_or_create_pool()
 # OR: We just instantiate it. The error `RuntimeError: no running event loop` confirms it tries to get loop.
 
 # Solution: We cannot instantiate AsyncPostgresSaver at module level if it requires a loop.
-# We should move `master_app = workflow.compile(...)` into a function or use a custom class that defers init.
-# BUT `master_app` is imported by server.py. 
-
-# Let's wrap the checkpointer creation.
-class LazyAsyncPostgresSaver(AsyncPostgresSaver):
-    def __init__(self, conn):
-        # Bypass parent __init__ that grabs loop immediately if possible
-        # Or we have to override methods.
-        # Looking at source, it sets self.loop = asyncio.get_running_loop()
-        
-        # We can just store the conn and init later? No, methods use self.loop.
-        self.conn = conn
-        self.loop = None 
-        # We don't call super().__init__ to avoid error, but we need to set other attrs.
-        self.serde = None # Will be set by compile? No.
-        # This is risky. 
-        pass
-
-# BETTER SOLUTION: 
-# Modify the code to compile the graph lazily or handle the import.
-# Since we are stuck with `from graph.main_agent import master_app`, we need `master_app` to exist.
-# Maybe we can use a dummy checkpointer for import time, and swap it at runtime? No.
-
-# Let's look at how we fixed Redis. We used a wrapper.
-# For Postgres, maybe we can try to pass a loop? No.
-
-# Let's try to make `master_app` a proxy?
-# Or: Catch the error and allow instantiation if loop is missing (but it will fail later)?
-
-# REAL FIX:
-# Don't export `master_app` as a global variable that executes side-effects.
-# But `server.py` expects it.
-# `add_routes(app, student_agent, ...)`
-
-# Let's modify `AsyncPostgresSaver` to not fail? We can't modify the library.
-
-# We will move the compilation to a function `get_master_app()`.
-# But `server.py` uses `add_routes` which usually takes a compiled graph.
-# `add_routes` supports a runnable.
-
-# Plan:
-# 1. Rename `master_app` to `_compiled_app` (initially None).
-# 2. Create a function `get_app()` that compiles it if needed.
-# 3. BUT `add_routes` needs the object immediately at import time usually? 
-#    Actually `add_routes` inspects the object.
-
-# Alternative:
-# Instantiate AsyncPostgresSaver ONLY when we are sure there is a loop? 
-# Server.py runs uvicorn, which has a loop. But the import happens BEFORE loop starts.
-
-# Wait, `uvicorn server:app` imports `server.py`.
-# `server.py` imports `graph.main_agent`.
-# `graph.main_agent` runs top-level code.
-# At this point, Uvicorn hasn't started the loop yet!
-
-# This is a common issue with async resources at module level.
-# We need to use `MemorySaver` (in-memory) for compilation at import time? 
-# And then swap it at runtime?
-# No, LangGraph compiles the checkpointer into the graph.
-
-# Let's use `MemorySaver` as a placeholder?
-# from langgraph.checkpoint.memory import MemorySaver
-# checkpointer = MemorySaver() 
-# master_app = workflow.compile(checkpointer=checkpointer)
-
-# And then in `lifespan` of server.py, we can re-compile?
-# Or `master_app.checkpointer = real_checkpointer`?
-# LangGraph `CompiledGraph` has a `.checkpointer` attribute.
-# We can try to swap it.
-
-from langgraph.checkpoint.memory import MemorySaver
-checkpointer_placeholder = MemorySaver()
-master_app = workflow.compile(checkpointer=checkpointer_placeholder)
+# And LangGraph API (langgraph dev) manages persistence automatically, so we should NOT provide a checkpointer here.
+# For local server (server.py), we will inject the checkpointer in the lifespan.
+master_app = workflow.compile()
 
 # We also need to export `pool` so server.py can open it.
 
