@@ -17,7 +17,7 @@ from core.django_setup import setup_django
 setup_django()
 
 from typing_extensions import TypedDict, Annotated, List, Literal, Dict, Any
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langchain_core.prompts import ChatPromptTemplate
@@ -51,6 +51,56 @@ def get_last_message_text(messages: List[BaseMessage]) -> str:
                 text_parts.append(block.get("text", ""))
         return " ".join(text_parts)
     return str(content)
+
+def _normalize_message_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                text_parts.append(block)
+        if text_parts:
+            return " ".join(text_parts)
+    if content is None:
+        return ""
+    return str(content)
+
+def _coerce_to_base_message(message: Any) -> BaseMessage:
+    if isinstance(message, BaseMessage):
+        content = _normalize_message_content(message.content)
+        if isinstance(message, HumanMessage):
+            return HumanMessage(content=content)
+        if isinstance(message, AIMessage):
+            return AIMessage(content=content)
+        if isinstance(message, SystemMessage):
+            return SystemMessage(content=content)
+        if isinstance(message, ToolMessage):
+            return ToolMessage(
+                content=content,
+                tool_call_id=message.tool_call_id,
+                name=message.name
+            )
+        return HumanMessage(content=content)
+
+    msg_type = getattr(message, "type", None)
+    content = _normalize_message_content(getattr(message, "content", None))
+
+    if msg_type in ("human", "user"):
+        return HumanMessage(content=content)
+    if msg_type in ("ai", "assistant"):
+        return AIMessage(content=content)
+    if msg_type == "system":
+        return SystemMessage(content=content)
+    if msg_type == "tool":
+        return ToolMessage(
+            content=content,
+            tool_call_id=getattr(message, "tool_call_id", ""),
+            name=getattr(message, "name", None)
+        )
+    return HumanMessage(content=content)
 
 # --- 1. Define Master State ---
 class MasterState(TypedDict):
@@ -213,6 +263,7 @@ async def chat_node(state: MasterState, config: RunnableConfig):
     """General Chat Node."""
     llm = Config.get_utility_llm()
     messages = state["messages"]
+    sanitized_messages = [_coerce_to_base_message(m) for m in messages]
     user_profile = state.get("user_profile", {})
     
     system_message = MAIN_CHAT_SYSTEM_MESSAGE
@@ -227,7 +278,7 @@ async def chat_node(state: MasterState, config: RunnableConfig):
     ])
     
     chain = prompt | llm
-    response = await chain.ainvoke({"messages": messages}, config=config)
+    response = await chain.ainvoke({"messages": sanitized_messages}, config=config)
     return {"messages": [response]}
 
 async def prep_recommendation_node(state: MasterState):
@@ -278,6 +329,7 @@ async def project_qa_node(state: MasterState, config: RunnableConfig):
     Maintains conversation context.
     """
     target_id = state.get("target_project_id")
+    target_id_str = str(target_id) if target_id is not None else ""
     messages = state["messages"]
     last_question = get_last_message_text(messages)
     llm = Config.get_utility_llm()
@@ -328,7 +380,7 @@ async def project_qa_node(state: MasterState, config: RunnableConfig):
         "project_ids": [target_id],
         "query": standalone_question
     })
-    chunks_list = context_chunks.get(target_id, []) if context_chunks else []
+    chunks_list = context_chunks.get(target_id_str, []) if context_chunks else []
     source = "Detailed Documents"
     
     # B. Fallback to Embeddings
@@ -337,7 +389,7 @@ async def project_qa_node(state: MasterState, config: RunnableConfig):
             "project_ids": [target_id],
             "query": standalone_question
         })
-        chunks_list = summary_chunks.get(target_id, []) if summary_chunks else []
+        chunks_list = summary_chunks.get(target_id_str, []) if summary_chunks else []
         source = "Project Summary"
     
     context_text = "\n\n".join(chunks_list)
@@ -417,4 +469,3 @@ pool = PostgresPool.get_or_create_pool()
 master_app = workflow.compile()
 
 # We also need to export `pool` so server.py can open it.
-
