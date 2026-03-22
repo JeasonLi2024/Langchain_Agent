@@ -89,11 +89,11 @@
 
 ---
 
-## 服务启动与调用指南（仍在开发，此处为AI生成的预示例，目前可通过Langchain开源的Agent_Chat_UI对话体验，详见下文）
+## 服务启动与调用指南（此处的前端接口为AI生成的预示例，目前可通过Langchain开源的Agent_Chat_UI对话体验，详见下文）
 
 ### 1. 后端服务启动
 
-确保已配置好 `core/config.py` 中的数据库与 LLM 密钥，然后运行：
+开发模式下：确保已配置好 `core/config.py` 中的数据库与 LLM 密钥，然后运行：
 
 ```bash
 # 在 /mnt/data/langchain-v2.0 目录下
@@ -102,6 +102,32 @@ python server.py
 ```
 *   服务默认运行在 `http://0.0.0.0:50018`
 *   API 文档地址: `http://localhost:50018/docs`
+
+生产模式下：服务通过 /mnt/data/langchain-v2.0/langchain_supervisor.conf 进行统一管理：
+
+1. 进程管理器 (Supervisor) ：
+- 定义了名为 [program:langchain-server] 的主服务进程。
+- 配置了 autostart=true 和 autorestart=true ，确保服务器开机自启，并在崩溃时自动重启。
+2. 网关服务器 (Gunicorn + Uvicorn) ：
+- 启动命令 ： /home/bupt/Server_Project_ZH/venv/bin/gunicorn server:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:50018 --timeout 120
+- 多进程并发 ：使用了 Gunicorn 作为进程管理器，启动了 4 个 Worker 进程 ( -w 4 )，能够充分利用多核 CPU 处理高并发请求。
+- 异步处理 ：由于 LangChain/LangGraph 依赖大量的异步 I/O（如网络请求大模型），这里指定了 uvicorn.workers.UvicornWorker 作为工作模式，使其具备处理 ASGI 异步应用的能力。
+- 防超时机制 ：显式设置了 --timeout 120 。因为 LLM (大语言模型) 生成回复往往耗时较长，这可以防止 Gunicorn 主进程误判 Worker 无响应而将其杀掉。
+3. 环境依赖 ：
+- 服务运行在主项目独立的虚拟环境 /home/bupt/Server_Project_ZH/venv 中。
+- 注入了必要的环境变量： PORT=50018 ， DJANGO_PROJECT_ROOT="/home/bupt/Server_Project_ZH" ，说明 LangChain 后端需要与 Django 主站进行交互或共享配置。
+4. 日志管理 ：
+- 标准输出和错误输出分别重定向到 logs/server.out.log 和 logs/server.err.log 。
+- 配置了日志轮转（单个文件最大 50MB，保留 10 个备份），防止长时间运行撑爆磁盘。
+
+此时任何修改后需要通过 Supervisor 重启对应的服务进程来让配置生效：
+```bash
+# 在 /mnt/data/langchain-v2.0 目录下
+source /home/bupt/Server_Project_ZH/venv/bin/activate
+sudo supervisorctl restart langchain-server langchain-cleanup
+```
+
+启动后可通过`sudo supervisorctl status`查看服务状态
 
 ### 2. 前端调用接口指南
 
