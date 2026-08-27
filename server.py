@@ -1,5 +1,7 @@
 
 import os
+import sys
+import logging
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,6 +10,26 @@ from starlette.types import Message
 import json
 from contextlib import asynccontextmanager
 from core.db import PostgresPool
+
+# 0. Configure root logger so every record carries a timestamp.
+# Format: 2026-06-08 12:34:56,789 [INFO] core.foo: message
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format=LOG_FORMAT,
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+    force=True,
+)
+# Also reconfigure uvicorn/gunicorn loggers so worker logs share the same prefix
+for _name in ("uvicorn", "uvicorn.error", "uvicorn.access", "gunicorn.error", "gunicorn.access"):
+    _logger = logging.getLogger(_name)
+    _logger.handlers = []
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt="%Y-%m-%d %H:%M:%S"))
+    _logger.addHandler(_handler)
+    _logger.propagate = False
+logger = logging.getLogger("langchain_server")
 
 # python server.py
 # API 文档 : http://localhost:8000/docs
@@ -54,7 +76,7 @@ async def lifespan(app: FastAPI):
     # 3. Swap for QA Agent
     qa_agent.checkpointer = real_checkpointer
     
-    print("Swapped In-Memory Checkpointers with AsyncPostgresSaver.")
+    logger.info("Swapped In-Memory Checkpointers with AsyncPostgresSaver.")
     
     yield
     # Shutdown: Close Database Pool

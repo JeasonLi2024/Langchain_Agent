@@ -16,7 +16,7 @@ from core.config import Config
 from core.django_setup import setup_django
 setup_django()
 
-from typing_extensions import TypedDict, Annotated, List, Literal, Dict, Any
+from typing_extensions import TypedDict, Annotated, List, Literal, Dict, Any, NotRequired
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage, ToolMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
@@ -39,7 +39,7 @@ def get_last_message_text(messages: List[BaseMessage]) -> str:
     """Helper to extract text from the last message, handling list-based content."""
     if not messages:
         return ""
-    last_msg = messages[-1]
+    last_msg = _coerce_to_base_message(messages[-1])
     content = last_msg.content
     if isinstance(content, str):
         return content
@@ -69,6 +69,23 @@ def _normalize_message_content(content: Any) -> str:
     return str(content)
 
 def _coerce_to_base_message(message: Any) -> BaseMessage:
+    if isinstance(message, dict):
+        msg_type = message.get("type") or message.get("role")
+        content = _normalize_message_content(message.get("content"))
+        if msg_type in ("human", "user"):
+            return HumanMessage(content=content)
+        if msg_type in ("ai", "assistant", "bot"):
+            return AIMessage(content=content)
+        if msg_type == "system":
+            return SystemMessage(content=content)
+        if msg_type == "tool":
+            return ToolMessage(
+                content=content,
+                tool_call_id=message.get("tool_call_id", ""),
+                name=message.get("name")
+            )
+        return HumanMessage(content=content)
+
     if isinstance(message, BaseMessage):
         content = _normalize_message_content(message.content)
         if isinstance(message, HumanMessage):
@@ -102,7 +119,16 @@ def _coerce_to_base_message(message: Any) -> BaseMessage:
         )
     return HumanMessage(content=content)
 
-# --- 1. Define Master State ---
+# --- 1. Define State ---
+class StudentInputState(TypedDict):
+    """
+    Public input schema exposed through LangServe.
+    Only allow client-provided fields and keep the rest of the graph state internal.
+    """
+    messages: List[Dict[str, Any]]
+    user_info: NotRequired[dict]
+
+
 class MasterState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     next_step: str
@@ -114,9 +140,23 @@ class MasterState(TypedDict):
     
     # Subgraph compatibility fields (AgentState)
     user_input: str
+    user_id: int
     student_id: int
+    thread_id: str
     profile_data: Dict[str, Any]
     final_output: str
+    student_db_profile: Dict[str, Any]
+    confirmed_interest_tags: List[Dict[str, Any]]
+    confirmed_skill_tags: List[Dict[str, Any]]
+    current_profile: Dict[str, Any]
+    profile_draft: Dict[str, Any]
+    student_pending_updates: Dict[str, Any]
+    profile_missing_fields: List[str]
+    profile_summary: str
+    candidate_interest_tags: List[Dict[str, Any]]
+    candidate_skill_tags: List[Dict[str, Any]]
+    profile_evidence: List[Dict[str, Any]]
+    profile_gate_decision: str
     keywords: Any
     context_str: str
     projects_json: Any
@@ -281,30 +321,62 @@ async def chat_node(state: MasterState, config: RunnableConfig):
     response = await chain.ainvoke({"messages": sanitized_messages}, config=config)
     return {"messages": [response]}
 
-async def prep_recommendation_node(state: MasterState):
+async def prep_recommendation_node(state: MasterState, config: RunnableConfig):
     """Prepare input for recommendation subgraph."""
     user_info = state.get("user_info", {})
+    normalized_messages = [_coerce_to_base_message(m) for m in state.get("messages", [])]
+    configurable = (config or {}).get("configurable", {}) if isinstance(config, dict) else getattr(config, "configurable", {}) or {}
+    student_id = (
+        user_info.get("student_id")
+        or user_info.get("student_pk")
+        or user_info.get("student_profile_id")
+        or user_info.get("id")
+        or state.get("student_id")
+    )
+    user_id = user_info.get("user_id") or user_info.get("id") or state.get("user_id")
+    thread_id = (
+        state.get("thread_id")
+        or configurable.get("thread_id")
+        or user_info.get("thread_id")
+        or user_info.get("session_id")
+        or f"student-{student_id or 'anonymous'}"
+    )
     return {
-        "user_input": get_last_message_text(state["messages"]),
-        "student_id": user_info.get("id") or 700,
-        "profile_data": {} 
+        "messages": normalized_messages,
+        "user_input": get_last_message_text(normalized_messages),
+        "user_id": user_id,
+        "student_id": student_id,
+        "thread_id": thread_id,
+        "profile_data": state.get("profile_data", {}),
+        "profile_draft": state.get("profile_draft", {}),
+        "profile_summary": state.get("profile_summary", ""),
+        "profile_missing_fields": state.get("profile_missing_fields", []),
+        "confirmed_interest_tags": state.get("confirmed_interest_tags", []),
+        "confirmed_skill_tags": state.get("confirmed_skill_tags", []),
+        "current_profile": state.get("current_profile", {}),
+        "candidate_interest_tags": state.get("candidate_interest_tags", []),
+        "candidate_skill_tags": state.get("candidate_skill_tags", []),
     }
 
 async def summarize_recommendation_node(state: MasterState, config: RunnableConfig):
     """Summarize the result from the subgraph."""
     profile_data = state.get("profile_data", {})
     user_input = state.get("user_input", "")
+    final_output = state.get("final_output", "")
     
-    if not profile_data and state.get("final_output"):
+    if not profile_data and final_output:
         import re
-        content = state["final_output"]
+        content = final_output
         try:
             json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL | re.IGNORECASE)
             if json_match:
                 profile_data = json.loads(json_match.group(1))
         except:
             pass
-    
+
+    if final_output and (not profile_data or "recommended_projects" not in profile_data):
+        return {"messages": [AIMessage(content=final_output)]}
+
     if not profile_data:
         return {"messages": [AIMessage(content="抱歉，我没有找到合适的推荐结果。")]}
         
@@ -319,7 +391,8 @@ async def summarize_recommendation_node(state: MasterState, config: RunnableConf
     
     return {
         "messages": [response],
-        "user_profile": profile_data
+        "user_profile": profile_data,
+        "profile_summary": profile_data.get("profile_summary") or state.get("profile_summary", ""),
     }
 
 async def project_qa_node(state: MasterState, config: RunnableConfig):
@@ -330,7 +403,7 @@ async def project_qa_node(state: MasterState, config: RunnableConfig):
     """
     target_id = state.get("target_project_id")
     target_id_str = str(target_id) if target_id is not None else ""
-    messages = state["messages"]
+    messages = [_coerce_to_base_message(m) for m in state["messages"]]
     last_question = get_last_message_text(messages)
     llm = Config.get_utility_llm()
     
@@ -419,7 +492,7 @@ async def project_qa_node(state: MasterState, config: RunnableConfig):
 
 
 # --- 3. Build Master Graph ---
-workflow = StateGraph(MasterState)
+workflow = StateGraph(MasterState, input=StudentInputState)
 
 workflow.add_node("router", router_node)
 workflow.add_node("chat_node", chat_node)

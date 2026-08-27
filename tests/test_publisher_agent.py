@@ -1,6 +1,8 @@
 
 import os
 import sys
+import uuid
+import tempfile
 import django
 from django.conf import settings
 
@@ -20,13 +22,14 @@ if project_root and project_root not in sys.path:
 
 # Setup Django with SQLite for testing
 if not settings.configured:
+    test_db_path = os.path.join(tempfile.gettempdir(), "langchain_v2_test_db.sqlite3")
     settings.configure(
         DEBUG=True,
         SECRET_KEY='test',
         DATABASES={
             'default': {
                 'ENGINE': 'django.db.backends.sqlite3',
-                'NAME': 'test_db.sqlite3',
+                'NAME': test_db_path,
             }
         },
         INSTALLED_APPS=[
@@ -55,8 +58,8 @@ from django.contrib.auth import get_user_model
 from user.models import OrganizationUser
 from organization.models import Organization
 from project.models import Requirement
-from graph.publisher_agent import publisher_app
-from langchain_core.messages import HumanMessage, AIMessage
+from graph.publisher_agent import publisher_app, save_requirement, finalize_save_node
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
 User = get_user_model()
 
@@ -137,3 +140,61 @@ def test_publisher_agent():
 
 if __name__ == "__main__":
     test_publisher_agent()
+
+
+def _ensure_test_org_user():
+    username = "agent_test_user"
+    email = "agent_test@example.com"
+    user, created = User.objects.get_or_create(username=username, defaults={"email": email, "password": "password"})
+    if created:
+        user.set_password("password")
+        user.save()
+
+    org, _ = Organization.objects.get_or_create(
+        name="Agent Test Org",
+        defaults={
+            "organization_type": 'other',
+            "other_type": 'other',
+            "status": 'verified',
+            "contact_person": 'Tester',
+            "contact_phone": '12345678901'
+        }
+    )
+    OrganizationUser.objects.get_or_create(user=user, organization=org, defaults={"permission": 'admin'})
+    return user, org
+
+
+def test_save_requirement_idempotent_publish():
+    user, org = _ensure_test_org_user()
+    unique_title = f"idempotent-publish-{uuid.uuid4().hex[:8]}"
+    payload = {
+        "user_id": user.id,
+        "org_id": org.id,
+        "title": unique_title,
+        "description": "用于验证发布工具的重复调用幂等保护。",
+        "brief": "幂等保护测试",
+        "status": "under_review",
+    }
+
+    first = save_requirement.invoke(payload)
+    second = save_requirement.invoke(payload)
+
+    reqs = Requirement.objects.filter(title=unique_title, organization=org).order_by("id")
+    assert reqs.count() == 1
+    assert first == second
+    assert f"ID: {reqs.first().id}" in first
+
+
+def test_finalize_save_node_marks_complete():
+    state = {
+        "messages": [
+            ToolMessage(
+                content="Published successfully. ID: 123",
+                name="save_requirement",
+                tool_call_id="call_test",
+            )
+        ]
+    }
+    result = finalize_save_node(state)
+    assert result["is_complete"] is True
+    assert "123" in result["messages"][0].content

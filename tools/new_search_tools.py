@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import asyncio
 import pymysql
 from langchain_core.tools import tool
 from core.config import Config
@@ -8,8 +9,25 @@ from core.config import Config
 # Ensure parent directory is in path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+
+def _fetch_semantic_project_rows(project_ids: list[int]) -> list[dict]:
+    conn = Config.get_db_connection()
+    try:
+        cursor = conn.cursor(pymysql.cursors.DictCursor)
+        format_strings = ",".join(["%s"] * len(project_ids))
+        sql = f"""
+            SELECT id, title, status, description 
+            FROM project_requirement 
+            WHERE id IN ({format_strings})
+            AND status IN ('under_review', 'in_progress', 'completed')
+        """
+        cursor.execute(sql, tuple(project_ids))
+        return list(cursor.fetchall())
+    finally:
+        conn.close()
+
 @tool
-def search_projects_by_tags(interest_ids: list[int], skill_ids: list[int]) -> list[dict]:
+def search_projects_by_tags(interest_ids: list[int], skill_ids: list[int], k: int = 20) -> list[dict]:
     """
     Track 1: Retrieve candidate projects based on Tag IDs (Precise Match).
     Returns list of dictionaries with scores.
@@ -81,10 +99,10 @@ def search_projects_by_tags(interest_ids: list[int], skill_ids: list[int]) -> li
             
     # Sort by score
     sorted_candidates = sorted(candidates.values(), key=lambda x: x['score'], reverse=True)
-    return sorted_candidates[:20]
+    return sorted_candidates[:k]
 
 @tool
-async def search_projects_semantic(query: str) -> list[dict]:
+async def search_projects_semantic(query: str, k: int = 20) -> list[dict]:
     """
     Track 2: Retrieve candidate projects based on Semantic Similarity (Fuzzy Match).
     Uses 'project_embeddings' collection.
@@ -95,7 +113,7 @@ async def search_projects_semantic(query: str) -> list[dict]:
     
     try:
         # Search
-        docs = await store.asimilarity_search_with_score(query, k=20)
+        docs = await store.asimilarity_search_with_score(query, k=k)
         
         project_ids = []
         for doc, score in docs:
@@ -108,36 +126,21 @@ async def search_projects_semantic(query: str) -> list[dict]:
         if not project_ids:
             return []
             
-        # Fetch details from DB to fill title, status, etc.
-        conn = Config.get_db_connection()
-        try:
-            # Standard pymysql connection, pass cursor class as argument
-            cursor = conn.cursor(pymysql.cursors.DictCursor)
-            format_strings = ','.join(['%s'] * len(project_ids))
-            sql = f"""
-                SELECT id, title, status, description 
-                FROM project_requirement 
-                WHERE id IN ({format_strings})
-                AND status IN ('under_review', 'in_progress', 'completed')
-            """
-            cursor.execute(sql, tuple(project_ids))
-            rows = cursor.fetchall()
-            
-            for row in rows:
-                pid = row['id']
-                if pid in milvus_matches:
-                    match_info = milvus_matches[pid]
-                    results.append({
-                        "id": pid,
-                        "title": row['title'],
-                        "status": row['status'],
-                        "description": row['description'], # Use clean DB description
-                        "score": match_info['score'],
-                        "match_type": "semantic"
-                    })
-        finally:
-            if conn:
-                conn.close()
+        # Offload sync MySQL access to a worker thread.
+        rows = await asyncio.to_thread(_fetch_semantic_project_rows, project_ids)
+
+        for row in rows:
+            pid = row['id']
+            if pid in milvus_matches:
+                match_info = milvus_matches[pid]
+                results.append({
+                    "id": pid,
+                    "title": row['title'],
+                    "status": row['status'],
+                    "description": row['description'], # Use clean DB description
+                    "score": match_info['score'],
+                    "match_type": "semantic"
+                })
 
     except Exception as e:
         print(f"Error in semantic search: {e}")
@@ -145,7 +148,7 @@ async def search_projects_semantic(query: str) -> list[dict]:
     return results
 
 @tool
-def search_projects_fulltext(keywords: list[str]) -> list[dict]:
+def search_projects_fulltext(keywords: list[str], k: int = 20) -> list[dict]:
     """
     Track 3: Retrieve candidate projects based on Fulltext Search (Keyword Match).
     Uses MySQL Fulltext Index.
@@ -170,9 +173,9 @@ def search_projects_fulltext(keywords: list[str]) -> list[dict]:
             WHERE MATCH(title, description) AGAINST (%s IN BOOLEAN MODE)
             AND status IN ('under_review', 'in_progress', 'completed')
             ORDER BY score DESC
-            LIMIT 20
+            LIMIT %s
         """
-        cursor.execute(sql, (search_query, search_query))
+        cursor.execute(sql, (search_query, search_query, k))
         rows = cursor.fetchall()
         
         # Fallback to LIKE if no results found with Fulltext (e.g. CJK issues)
@@ -180,9 +183,9 @@ def search_projects_fulltext(keywords: list[str]) -> list[dict]:
             # Construct LIKE query: title LIKE %k1% OR description LIKE %k1% ...
             conditions = []
             params = []
-            for k in keywords:
+            for keyword in keywords:
                 conditions.append("(title LIKE %s OR description LIKE %s)")
-                params.extend([f"%{k}%", f"%{k}%"])
+                params.extend([f"%{keyword}%", f"%{keyword}%"])
             
             where_clause = " OR ".join(conditions)
             sql_like = f"""
@@ -191,9 +194,9 @@ def search_projects_fulltext(keywords: list[str]) -> list[dict]:
                 FROM project_requirement
                 WHERE ({where_clause})
                 AND status IN ('under_review', 'in_progress', 'completed')
-                LIMIT 20
+                LIMIT %s
             """
-            cursor.execute(sql_like, tuple(params))
+            cursor.execute(sql_like, tuple(params + [k]))
             rows = cursor.fetchall()
             # Mark as LIKE match
             for row in rows:

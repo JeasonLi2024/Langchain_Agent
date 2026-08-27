@@ -1,6 +1,7 @@
 import json
 import sys
 import os
+import asyncio
 import django
 import base64
 import tempfile
@@ -28,7 +29,7 @@ from core.config import Config
 from core.prompts import PUBLISHER_ROUTER_PROMPT, PUBLISHER_CHAT_SYSTEM_PROMPT
 from graph.publisher_agent import publisher_app
 from graph.file_parsing_graph import file_parsing_app
-from core.embedding_service import generate_embedding, get_or_create_collection, COLLECTION_EMBEDDINGS, COLLECTION_RAW_DOCS
+from core.embedding_service import EmbeddingService, get_or_create_collection, COLLECTION_EMBEDDINGS, COLLECTION_RAW_DOCS
 from project.services import delete_requirement_vectors, sync_raw_docs_from_text
 from project.models import Requirement
 from project.signals import handle_requirement_save, handle_files_change, handle_tags_change
@@ -52,6 +53,55 @@ def suppress_signals():
         m2m_changed.connect(handle_files_change, sender=Requirement.files.through)
         m2m_changed.connect(handle_tags_change, sender=Requirement.tag1.through)
         m2m_changed.connect(handle_tags_change, sender=Requirement.tag2.through)
+
+
+def _sync_raw_doc_vectors(requirement_id: int, chunks: list[str], embeddings: list[list[float]]) -> int:
+    delete_requirement_vectors(requirement_id, [COLLECTION_RAW_DOCS])
+    collection = get_or_create_collection(COLLECTION_RAW_DOCS)
+    pids = [requirement_id] * len(chunks)
+    valid_data = [
+        (pid, vector, chunk, index)
+        for index, (pid, vector, chunk) in enumerate(zip(pids, embeddings, chunks))
+        if vector and len(vector) > 0
+    ]
+    if not valid_data:
+        return 0
+
+    data_insert = [
+        [item[0] for item in valid_data],
+        [item[1] for item in valid_data],
+        [item[2][:65535] for item in valid_data],
+        [item[3] for item in valid_data],
+    ]
+    collection.insert(data_insert)
+    collection.flush()
+    return len(valid_data)
+
+
+def _sync_semantic_vector(requirement_id: int, full_text: str, vector: list[float]) -> None:
+    data_emb = [
+        [requirement_id],
+        [vector],
+        [full_text[:65535]],
+    ]
+    try:
+        delete_requirement_vectors(requirement_id, [COLLECTION_EMBEDDINGS])
+        collection_emb = get_or_create_collection(COLLECTION_EMBEDDINGS)
+        collection_emb.insert(data_emb)
+        collection_emb.flush()
+    except Exception as exc:
+        if "schema" not in str(exc).lower() and "match" not in str(exc).lower():
+            raise
+
+        from pymilvus import utility
+
+        print("Attempting to fix schema mismatch by dropping collection...")
+        utility.drop_collection(COLLECTION_EMBEDDINGS)
+        print(f"Dropped {COLLECTION_EMBEDDINGS}, retrying insert...")
+        collection_emb = get_or_create_collection(COLLECTION_EMBEDDINGS)
+        collection_emb.insert(data_emb)
+        collection_emb.flush()
+        print("Retry successful.")
 
 # Import Postgres Saver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -328,7 +378,7 @@ async def router_node(state: PublisherMasterState):
              # Let's use LLM to be safe
              pass
              
-        response = llm.invoke(prompt.format(message=last_msg))
+        response = await llm.ainvoke(prompt.format(message=last_msg))
         intent = response.content.strip().upper()
         
         if "PUBLISH" in intent:
@@ -338,14 +388,14 @@ async def router_node(state: PublisherMasterState):
     except:
         return {"next_step": "chat_node"}
 
-def chat_node(state: PublisherMasterState):
+async def chat_node(state: PublisherMasterState):
     """
     Simple Chat / Greeting Node.
     """
     llm = Config.get_utility_llm()
     messages = state["messages"]
     
-    # Sanitize messages to ensure content is string for ChatTongyi (doesn't support list/multimodal content)
+    # Sanitize messages so gateway-backed chat models receive consistent message content.
     sanitized_messages = []
     for m in messages:
         content = m.content
@@ -385,7 +435,7 @@ def chat_node(state: PublisherMasterState):
     ])
     
     chain = prompt | llm
-    response = chain.invoke({"messages": sanitized_messages})
+    response = await chain.ainvoke({"messages": sanitized_messages})
     
     return {"messages": [response]}
 
@@ -501,6 +551,10 @@ async def publisher_bridge_node(state: PublisherMasterState, config: RunnableCon
                                 "id": req.id,
                                 "title": req.title,
                                 "description": req.description,
+                                "goal": getattr(req, "goal", ""),
+                                "expected_result": getattr(req, "expected_result", ""),
+                                "contact_person": getattr(req, "contact_person", ""),
+                                "contact_info": getattr(req, "contact_info", ""),
                                 "tags": tags1 + tags2,
                                 "status": req.status
                             }
@@ -593,24 +647,14 @@ async def publisher_bridge_node(state: PublisherMasterState, config: RunnableCon
                 # 1. Sync Raw Docs (Chunks)
                 if chunks and embeddings and len(chunks) == len(embeddings):
                     try:
-                        # Clear potential backend fallback data first
-                        delete_requirement_vectors(new_req_id, [COLLECTION_RAW_DOCS])
-                        
-                        collection = get_or_create_collection(COLLECTION_RAW_DOCS)
-                        pids = [new_req_id] * len(chunks)
-                        # Filter valid embeddings
-                        valid_data = [(p, v, c, i) for i, (p, v, c) in enumerate(zip(pids, embeddings, chunks)) if v and len(v) > 0]
-                        
-                        if valid_data:
-                            data_insert = [
-                                [x[0] for x in valid_data], # pids
-                                [x[1] for x in valid_data], # vectors
-                                [x[2][:65535] for x in valid_data], # content
-                                [x[3] for x in valid_data]  # indices
-                            ]
-                            collection.insert(data_insert)
-                            collection.flush()
-                            print(f"Successfully inserted {len(valid_data)} chunks into {COLLECTION_RAW_DOCS}")
+                        inserted_count = await asyncio.to_thread(
+                            _sync_raw_doc_vectors,
+                            new_req_id,
+                            chunks,
+                            embeddings,
+                        )
+                        if inserted_count:
+                            print(f"Successfully inserted {inserted_count} chunks into {COLLECTION_RAW_DOCS}")
                     except Exception as e:
                         print(f"Error in manual raw docs sync: {e}")
                 
@@ -621,39 +665,28 @@ async def publisher_bridge_node(state: PublisherMasterState, config: RunnableCon
                         title = final_req_data.get("title", "")
                         desc = final_req_data.get("description", "")
                         tags = final_req_data.get("tags", [])
+                        goal = final_req_data.get("goal", "")
+                        expected_result = final_req_data.get("expected_result", "")
+                        contact_person = final_req_data.get("contact_person", "")
+                        contact_info = final_req_data.get("contact_info", "")
                         # Brief might be missing in final_req_data dict, retrieve from draft_data or empty
                         brief = publisher_state.get("draft_data", {}).get("brief", "")
                         
-                        full_text = f"Title: {title}\nBrief: {brief}\nDescription: {desc}\nTags: {', '.join(tags)}"
+                        full_text = (
+                            f"Title: {title}\nBrief: {brief}\nDescription: {desc}\n"
+                            f"Goal: {goal}\nExpected Result: {expected_result}\n"
+                            f"Contact Person: {contact_person}\nContact Info: {contact_info}\n"
+                            f"Tags: {', '.join(tags)}"
+                        )
                         
-                        vector = generate_embedding(full_text)
+                        vector_batch = await EmbeddingService.aget_embeddings([full_text])
+                        vector = vector_batch[0] if vector_batch else None
                         
                         if vector:
-                            delete_requirement_vectors(new_req_id, [COLLECTION_EMBEDDINGS])
-                            collection_emb = get_or_create_collection(COLLECTION_EMBEDDINGS)
-                            data_emb = [
-                                [new_req_id],
-                                [vector],
-                                [full_text[:65535]]
-                            ]
-                            collection_emb.insert(data_emb)
-                            collection_emb.flush()
+                            await asyncio.to_thread(_sync_semantic_vector, new_req_id, full_text, vector)
                             print(f"Successfully inserted semantic embedding into {COLLECTION_EMBEDDINGS}")
                     except Exception as e:
                         print(f"Error in manual semantic sync: {e}")
-                        # If schema mismatch, try to recover (in dev/test env only)
-                        if "schema" in str(e).lower() or "match" in str(e).lower():
-                             print("Attempting to fix schema mismatch by dropping collection...")
-                             try:
-                                 from pymilvus import utility
-                                 utility.drop_collection(COLLECTION_EMBEDDINGS)
-                                 print(f"Dropped {COLLECTION_EMBEDDINGS}, retrying insert...")
-                                 collection_emb = get_or_create_collection(COLLECTION_EMBEDDINGS)
-                                 collection_emb.insert(data_emb)
-                                 collection_emb.flush()
-                                 print(f"Retry successful.")
-                             except Exception as retry_e:
-                                 print(f"Retry failed: {retry_e}")
 
         except Exception as e:
             print(f"Error attaching file: {e}")

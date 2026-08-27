@@ -10,14 +10,21 @@ from core.prompts import TAG_RECOMMENDATION_SYSTEM_PROMPT, TAG_RECOMMENDATION_HU
 from tools.search_tools import extract_keywords, retrieve_tags
 from langchain_core.runnables import RunnableConfig
 
-async def recommend_tags_logic(description: str, research_direction: str, skill: str, config: RunnableConfig = None) -> str:
+async def recommend_tags_logic(
+    description: str,
+    research_direction: str,
+    skill: str,
+    goal: str = "",
+    expected_result: str = "",
+    config: RunnableConfig = None,
+) -> str:
     """
     Recommend 3 interest tags and 5 skill tags based on project requirement details.
     Returns a string containing the thinking process and the final JSON result.
     """
     
     # 1. Construct query context
-    query_text = f"{description} {research_direction} {skill}"
+    query_text = f"{description} {research_direction} {skill} {goal} {expected_result}"
     
     # 2. Extract Keywords
     keywords = await extract_keywords.ainvoke(query_text)

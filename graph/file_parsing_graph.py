@@ -105,11 +105,6 @@ async def ranking_node(state: FileParsingState):
     query = "项目标题 项目简介 详细描述 研究方向 技术栈 完成时间 预算 资金支持"
     
     try:
-        # Embed query
-        query_vec = generate_embedding(query) # This is wrapper, let's keep it sync or make async wrapper. 
-        # But generate_embedding is sync wrapper. Let's use EmbeddingService.aget_single_embedding if possible or just accept one sync call.
-        # Ideally: query_vec = await EmbeddingService.aget_single_embedding(query) (I didn't add aget_single_embedding yet)
-        # I'll just use aget_embeddings([query])[0]
         query_vecs = await EmbeddingService.aget_embeddings([query])
         query_vec = query_vecs[0] if query_vecs else None
 
@@ -163,22 +158,25 @@ async def extraction_node(state: FileParsingState):
     context_text = "\n---\n".join(filtered_chunks)
     
     from core.config import Config
-    llm = Config.get_utility_llm()
     
     # Prompt
     prompt = f"""
     你是专业的文档信息结构化提取助手，擅长从文本中精准提取指定信息并按固定格式输出，无遗漏、无冗余、不篡改原文信息。
-    请从以下文档文本中，提取【标题、简介、详细描述、研究方向、技术栈、完成时间、预算、可提供的支持】这些核心信息，严格遵循以下要求：
+    请从以下文档文本中，提取【标题、简介、详细描述、研究方向、技术栈、目标、期望成果、联系人、联系方式、完成时间、预算、可提供的支持】这些核心信息，严格遵循以下要求：
     1. 标题：提取文档的核心主标题，若有副标题需一并提取，无则填“无”；
     2. 简介：提炼文档的核心主旨、创作目的、核心价值，控制在150字内，无则填“无”；
     3. 详细描述：提取文档的核心内容、关键细节、核心逻辑/框架，保留原文关键信息，无需缩写，无则填“无”；
     4. 研究方向：总结该需求项目的整体研究方向，用词语总结；
     5. 技术栈：分析该需求需要哪些技术技能，用词语总结；
-    6. 完成时间：该需求项目的DDL，表示格式为“YYYY-MM-DD"，无则填“无”；
-    7. 预算：提取文档中表示完成给需求项目时甲方可提供的资金支持，只提取数字（单位默认为万元，如“50”），不要包含“万元”等单位字样。若原文只有数字，默认其为万元，无则填“无”；
-    8. 可提供的支持：除了资金外其余待遇、帮助辅助事宜等，无则填“无”
-    9. 所有提取内容必须来自以下输入文本，不得凭空生成，原文无对应信息则统一填“无”；
-    10. 严格按【指定输出格式】输出，不得修改格式、不得添加额外说明、不得换行混乱。
+    6. 目标：提取或总结该需求要达成的直接目标；
+    7. 期望成果：提取或总结交付后希望看到的成果形式或验收标准；
+    8. 联系人：提取负责对接的人名；
+    9. 联系方式：提取联系人电话、邮箱、微信等可用联系方式；
+    10. 完成时间：该需求项目的DDL，表示格式为“YYYY-MM-DD"，无则填“无”；
+    11. 预算：提取文档中表示完成给需求项目时甲方可提供的资金支持，只提取数字（单位默认为万元，如“50”），不要包含“万元”等单位字样。若原文只有数字，默认其为万元，无则填“无”；
+    12. 可提供的支持：除了资金外其余待遇、帮助辅助事宜等，无则填“无”
+    13. 所有提取内容必须来自以下输入文本，不得凭空生成，原文无对应信息则统一填“无”；
+    14. 严格按【指定输出格式】输出，不得修改格式、不得添加额外说明、不得换行混乱。
 
     【输入文档文本】
     {context_text}
@@ -190,6 +188,10 @@ async def extraction_node(state: FileParsingState):
       "description": "提取的具体详细描述内容",
       "research_direction": "分析得到的研究方向总结",
       "skill": "分析所需的技术栈总结",
+            "goal": "提取的具体目标内容",
+            "expected_result": "提取的具体期望成果内容",
+            "contact_person": "提取的联系人",
+            "contact_info": "提取的联系方式",
       "finish_time": "提取的具体结束时间期限",
       "budget": "提取的具体资金支持数字（单位万元），如'50'",
       "support_provided": "提取的具体额外支持"
@@ -197,25 +199,8 @@ async def extraction_node(state: FileParsingState):
     """
     
     try:
-        # Use low temperature for extraction
-        # Config.get_utility_llm() returns a configured instance. 
-        # We can pass temperature override if the model supports bind or if we create a new instance.
-        # ChatTongyi supports `temperature` in constructor or bind.
-        # Since we use `llm.invoke`, we can't easily change temperature of the instance unless we re-instantiate or bind.
-        # Let's try to bind if supported or just use default (which is usually low-ish or adjustable via params).
-        # Assuming we can't easily change it without creating new LLM, we proceed. 
-        # (User asked for 0.0-0.2, but qwen-turbo default might be higher).
-        # Ideally: llm = ChatTongyi(..., temperature=0.1)
-        
-        # Re-instantiate for this specific task to ensure temperature constraint
-        from langchain_community.chat_models import ChatTongyi
-        llm_extraction = ChatTongyi(
-            model='qwen-turbo', 
-            api_key=Config.DASHSCOPE_API_KEY, 
-            streaming=True,
-            temperature=0.1 # Low temp as requested
-        )
-        
+        # Extraction uses a dedicated configurable gateway model instead of a hardcoded provider SDK.
+        llm_extraction = Config.get_extraction_llm(temperature=0.1)
         response = await llm_extraction.ainvoke(prompt)
         content = response.content
         

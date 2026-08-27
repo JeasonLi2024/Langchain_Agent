@@ -16,7 +16,7 @@
 ├── core/                       # 核心基础设施层
 │   ├── config.py               # 全局配置（LLM/DB连接/API Keys）
 │   ├── django_setup.py         # Django 环境初始化（ORM支持）
-│   ├── embedding_service.py    # 向量化服务（DashScope Embeddings + Milvus）
+│   ├── embedding_service.py    # 向量化服务（OpenAI兼容网关 Embeddings + Milvus）
 │   └── prompts.py              # Prompt 集中管理仓库
 ├── graph/                      # LangGraph 智能体图定义
 │   ├── main_agent.py           # [学生智能体] 主路由与RAG问答逻辑

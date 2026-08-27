@@ -69,7 +69,7 @@ def vectorize_projects():
 
     # 3. Setup Milvus Collection
     collection_name = "project_embeddings"
-    dim = 1536 # v4
+    dim = Config.get_text_embedding_dimension()
     
     # We use MilvusClient for easier management or Config.get_milvus_store
     # Config.get_milvus_store returns a LangChain VectorStore wrapper (Milvus)
@@ -81,7 +81,12 @@ def vectorize_projects():
         logger.info(f"Dropping existing collection '{collection_name}'...")
         client.drop_collection(collection_name)
         
-    logger.info(f"Creating collection '{collection_name}' with dim={dim}...")
+    logger.info(
+        "Creating collection '%s' with model=%s dim=%s...",
+        collection_name,
+        Config.get_text_embedding_model(),
+        dim,
+    )
     # Define schema explicitly to match what we want
     schema = MilvusClient.create_schema(
         auto_id=False,
@@ -90,7 +95,7 @@ def vectorize_projects():
     schema.add_field(field_name="id", datatype=DataType.INT64, is_primary=True)
     schema.add_field(field_name="vector", datatype=DataType.FLOAT_VECTOR, dim=dim)
     schema.add_field(field_name="project_id", datatype=DataType.INT64)
-    schema.add_field(field_name="text", datatype=DataType.VARCHAR, max_length=65535) # Content
+    schema.add_field(field_name="content", datatype=DataType.VARCHAR, max_length=65535)
     
     index_params = client.prepare_index_params()
     index_params.add_index(
@@ -129,7 +134,7 @@ def vectorize_projects():
                     "id": batch_ids[j],
                     "vector": vector,
                     "project_id": batch_ids[j],
-                    "text": batch_texts[j]
+                    "content": batch_texts[j]
                 })
                 
             client.insert(collection_name=collection_name, data=data)

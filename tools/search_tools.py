@@ -1,9 +1,29 @@
 import sys
 import os
+import asyncio
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from langchain_core.tools import tool
 from core.config import Config
+
+
+def _load_valid_project_ids(project_ids: set[int]) -> set[int]:
+    conn = Config.get_db_connection()
+    valid_ids = set()
+    try:
+        cursor = conn.cursor()
+        format_strings = ",".join(["%s"] * len(project_ids))
+        sql = f"""
+        SELECT id FROM project_requirement 
+        WHERE id IN ({format_strings}) 
+        AND status IN ('in_progress', 'completed', 'paused')
+        """
+        cursor.execute(sql, tuple(project_ids))
+        for row in cursor.fetchall():
+            valid_ids.add(row[0])
+        return valid_ids
+    finally:
+        conn.close()
 
 @tool
 def extract_keywords(user_input: str) -> list[str]:
@@ -121,22 +141,8 @@ async def retrieve_project_details(query: str) -> str:
         if not project_ids:
             return "No relevant project details found."
             
-        # Filter by Status via MySQL
-        conn = Config.get_db_connection()
-        valid_ids = set()
-        try:
-            cursor = conn.cursor()
-            format_strings = ','.join(['%s'] * len(project_ids))
-            sql = f"""
-            SELECT id FROM project_requirement 
-            WHERE id IN ({format_strings}) 
-            AND status IN ('in_progress', 'completed', 'paused')
-            """
-            cursor.execute(sql, tuple(project_ids))
-            for r in cursor.fetchall():
-                valid_ids.add(r[0])
-        finally:
-            conn.close()
+        # Offload sync MySQL access to a worker thread.
+        valid_ids = await asyncio.to_thread(_load_valid_project_ids, project_ids)
             
         # Filter docs
         results = []

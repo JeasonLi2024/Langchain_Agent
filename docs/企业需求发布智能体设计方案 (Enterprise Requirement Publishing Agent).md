@@ -133,7 +133,7 @@ str:
 
 1. 数据源 ： Requirement.title + Requirement.description + Requirement.tags (Text).
 2. 处理时机 ：仅当 Requirement.status 变为有效状态时。
-3. Embedding 模型 ： 必须 与 student_workflow.py 中用于处理 user_input 的模型一致（同为 text-embedding-v4 ）。
+3. Embedding 模型 ： 必须 与 student_workflow.py 中用于处理 user_input 的模型一致（当前统一为 bge-large-zh-v1.5 ）。
 4. 存储 ：Milvus Collection project_embeddings 。
    - Field: project_id (Int64)
    - Field: vector (FloatVector)

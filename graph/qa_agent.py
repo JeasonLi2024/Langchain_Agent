@@ -1,7 +1,7 @@
 import json
 import sys
 import os
-from typing_extensions import TypedDict, Annotated, List, Literal, Dict, Any
+from typing_extensions import TypedDict, Annotated, List, Literal, Dict, Any, NotRequired
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
@@ -15,7 +15,7 @@ def get_last_message_text(messages: List[BaseMessage]) -> str:
     """Helper to extract text from the last message, handling list-based content."""
     if not messages:
         return ""
-    last_msg = messages[-1]
+    last_msg = _coerce_to_base_message(messages[-1])
     content = last_msg.content
     if isinstance(content, str):
         return content
@@ -28,7 +28,49 @@ def get_last_message_text(messages: List[BaseMessage]) -> str:
         return " ".join(text_parts)
     return str(content)
 
+
+def _normalize_message_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                text_parts.append(block)
+        if text_parts:
+            return " ".join(text_parts)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _coerce_to_base_message(message: Any) -> BaseMessage:
+    if isinstance(message, BaseMessage):
+        return message
+
+    if isinstance(message, dict):
+        msg_type = message.get("type") or message.get("role")
+        content = _normalize_message_content(message.get("content"))
+        if msg_type in ("human", "user"):
+            return HumanMessage(content=content)
+        if msg_type in ("ai", "assistant", "bot"):
+            return AIMessage(content=content)
+        return HumanMessage(content=content)
+
+    return HumanMessage(content=_normalize_message_content(getattr(message, "content", message)))
+
 # --- 1. Define State ---
+class QAInputState(TypedDict):
+    """
+    Public input schema exposed through LangServe.
+    """
+    messages: List[Dict[str, Any]]
+    target_project_id: int
+    user_info: NotRequired[dict]
+
+
 class QAState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     target_project_id: int
@@ -45,7 +87,7 @@ async def qa_node(state: QAState, config: RunnableConfig):
     Maintains conversation context.
     """
     target_id = state.get("target_project_id")
-    messages = state["messages"]
+    messages = [_coerce_to_base_message(m) for m in state["messages"]]
     last_question = get_last_message_text(messages)
     llm = Config.get_utility_llm()
     
@@ -142,7 +184,7 @@ async def qa_node(state: QAState, config: RunnableConfig):
     return {"messages": [response]}
 
 # --- 3. Build Graph ---
-workflow = StateGraph(QAState)
+workflow = StateGraph(QAState, input=QAInputState)
 
 workflow.add_node("qa_node", qa_node)
 

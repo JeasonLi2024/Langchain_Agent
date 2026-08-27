@@ -1,4 +1,7 @@
 import json
+import os
+import re
+from datetime import timedelta
 from typing_extensions import TypedDict, Annotated, List, Dict, Any, Literal, Optional
 from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
@@ -10,6 +13,7 @@ from core.prompts import PUBLISHER_AGENT_SYSTEM_PROMPT
 from project.models import Requirement
 from user.models import OrganizationUser, User, Tag1, Tag2
 from graph.tag_recommendation import recommend_tags_logic
+from django.utils import timezone
 
 # --- State ---
 class PublisherState(TypedDict):
@@ -37,6 +41,23 @@ class PublisherState(TypedDict):
     next_step: str
     is_complete: bool
 
+
+SUCCESSFUL_SAVE_PREFIXES = (
+    "Published successfully. ID:",
+    "Draft Saved successfully. ID:",
+)
+
+
+def _is_successful_save_message(content: Any) -> bool:
+    return isinstance(content, str) and content.startswith(SUCCESSFUL_SAVE_PREFIXES)
+
+
+def _extract_requirement_id(content: Any) -> Optional[str]:
+    if not isinstance(content, str):
+        return None
+    match = re.search(r"ID:\s*(\d+)", content)
+    return match.group(1) if match else None
+
 @tool
 def save_requirement(
     user_id: int, 
@@ -46,6 +67,10 @@ def save_requirement(
     brief: str = "", 
     research_direction: str = "",
     skill: str = "",
+    goal: str = "",
+    expected_result: str = "",
+    contact_person: str = "",
+    contact_info: str = "",
     finish_time: str = None,
     budget: str = "",
     support_provided: str = "",
@@ -66,6 +91,10 @@ def save_requirement(
         brief: Short introduction (optional).
         research_direction: Research direction keywords.
         skill: Technology stack keywords.
+        goal: Project goal.
+        expected_result: Expected result/output.
+        contact_person: Contact person.
+        contact_info: Contact info.
         finish_time: Deadline (YYYY-MM-DD).
         budget: Budget support value in Ten Thousand Yuan (e.g., "50"). Only the number.
         support_provided: Other support.
@@ -76,6 +105,9 @@ def save_requirement(
         cover_image_url: The URL or path of the selected cover image (optional).
     """
     try:
+        title = (title or "").strip()
+        description = (description or "").strip()
+
         # Check user and org
         user = User.objects.get(id=user_id)
         try:
@@ -91,6 +123,24 @@ def save_requirement(
                 req = None
         else:
             req = None
+
+        # Duplicate publish guard:
+        # If the same org member publishes the same title again within a short window,
+        # treat it as a repeated tool invocation instead of creating another row.
+        if not req and status == 'under_review' and title:
+            recent_duplicate = (
+                Requirement.objects.filter(
+                    organization_id=org_id,
+                    publish_people=org_user,
+                    title=title,
+                    created_at__gte=timezone.now() - timedelta(minutes=3),
+                    status__in=['under_review', 'in_progress'],
+                )
+                .order_by('-created_at')
+                .first()
+            )
+            if recent_duplicate:
+                return f"Published successfully. ID: {recent_duplicate.id}"
             
         if not req:
             req = Requirement(
@@ -103,6 +153,15 @@ def save_requirement(
         req.description = description
         req.brief = brief or description[:100]
         req.status = status
+
+        if goal and goal != "无":
+            req.goal = goal
+        if expected_result and expected_result != "无":
+            req.expected_result = expected_result
+        if contact_person and contact_person != "无":
+            req.contact_person = contact_person
+        if contact_info and contact_info != "无":
+            req.contact_info = contact_info
 
         
         # Update standard fields present in model
@@ -133,7 +192,6 @@ def save_requirement(
         
         # Handle Cover Image Persistence
         # Check if cover_image_url indicates a temporary file (either in cover/tmp or generic tmp)
-        import os  # Import os here to avoid UnboundLocalError
         if cover_image_url and ("cover/tmp/" in cover_image_url or "/tmp/" in cover_image_url or "upload_" in os.path.basename(cover_image_url)):
             try:
                 import shutil
@@ -378,6 +436,10 @@ async def chat_node(state: PublisherState, config: RunnableConfig):
             "description": "详细描述",
             "research_direction": "研究方向",
             "skill": "技术栈",
+            "goal": "目标",
+            "expected_result": "期望成果",
+            "contact_person": "联系人",
+            "contact_info": "联系方式",
             "finish_time": "完成时间",
             "budget": "预算",
             "support_provided": "可提供的支持"
@@ -501,9 +563,11 @@ async def tag_recommendation_node(state: PublisherState, config: RunnableConfig)
     description = draft_data.get("description", "")
     research_direction = draft_data.get("research_direction", "")
     skill = draft_data.get("skill", "")
+    goal = draft_data.get("goal", "")
+    expected_result = draft_data.get("expected_result", "")
     
     # Call the logic
-    result_text = await recommend_tags_logic(description, research_direction, skill, config=config)
+    result_text = await recommend_tags_logic(description, research_direction, skill, goal, expected_result, config=config)
     
     # Find the tool call ID to respond to
     last_message = state["messages"][-1]
@@ -524,12 +588,43 @@ async def tag_recommendation_node(state: PublisherState, config: RunnableConfig)
         "tag_recommendation_trigger": False 
     }
 
+
+def finalize_save_node(state: PublisherState):
+    """
+    Turn a successful save tool result into a user-facing completion message
+    and mark the publisher flow as completed so the graph stops here.
+    """
+    last_message = state["messages"][-1]
+    if not isinstance(last_message, ToolMessage) or last_message.name != "save_requirement":
+        return {}
+
+    if not _is_successful_save_message(last_message.content):
+        return {"is_complete": False}
+
+    requirement_id = _extract_requirement_id(last_message.content)
+    if isinstance(last_message.content, str) and last_message.content.startswith("Draft Saved successfully. ID:"):
+        summary = "您的需求草稿已保存。"
+        if requirement_id:
+            summary += f" 草稿 ID：{requirement_id}。"
+        summary += " 请到“我的需求”中继续编辑。"
+    else:
+        summary = "您的项目需求已成功发布。"
+        if requirement_id:
+            summary += f" 需求 ID：{requirement_id}。"
+        summary += " 请到“我的需求”中查看。"
+
+    return {
+        "messages": [AIMessage(content=summary)],
+        "is_complete": True,
+    }
+
 # --- Graph ---
 workflow = StateGraph(PublisherState)
 
 workflow.add_node("chat", chat_node)
 workflow.add_node("tag_recommendation", tag_recommendation_node)
 workflow.add_node("cover_flow", cover_flow_node) # Add cover flow node
+workflow.add_node("finalize_save", finalize_save_node)
 
 from langgraph.prebuilt import ToolNode
 tool_node = ToolNode([save_requirement])
@@ -552,10 +647,22 @@ def should_continue(state: PublisherState):
         
     return END
 
+
+def after_tools(state: PublisherState):
+    last_message = state["messages"][-1]
+    if (
+        isinstance(last_message, ToolMessage)
+        and last_message.name == "save_requirement"
+        and _is_successful_save_message(last_message.content)
+    ):
+        return "finalize_save"
+    return "chat"
+
 workflow.add_conditional_edges("chat", should_continue, ["tools", "tag_recommendation", "cover_flow", END])
-workflow.add_edge("tools", "chat")
+workflow.add_conditional_edges("tools", after_tools, ["chat", "finalize_save"])
 workflow.add_edge("tag_recommendation", "chat") # Loop back to agent to summarize
 workflow.add_edge("cover_flow", "chat") # Loop back to agent
+workflow.add_edge("finalize_save", END)
 
 # Compile with interrupt_before for HITL on sensitive tool usage
 # NOTE: In production with custom UI, you must handle the 'interrupt' state.
