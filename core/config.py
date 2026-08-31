@@ -44,6 +44,14 @@ class Config:
     ARK_API_KEY = os.getenv('ARK_API_KEY')
     MILVUS_HOST = os.getenv('MILVUS_HOST', 'localhost')
     MILVUS_PORT = os.getenv('MILVUS_PORT', '19530')
+    # Milvus Lite (embedded) mode: when set (e.g. "./milvus.db"), takes precedence over host/port.
+    # NOTE: do NOT name this env var MILVUS_URI — it is reserved by pymilvus (must be an http URL,
+    # a .db path breaks pymilvus import because pymilvus auto-loads .env from CWD).
+    MILVUS_LITE_URI = os.getenv('MILVUS_LITE_URI', '')
+    # Dedicated database on a remote Milvus server for experiment isolation (e.g. "exp1_eval").
+    # Only effective in host/port mode (Milvus Lite is single-db); all collections created/read
+    # through this config land in that database, leaving the server's "default" db untouched.
+    MILVUS_DB_NAME = os.getenv('MILVUS_DB_NAME', '')
     REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
     REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
     REDIS_DB = int(os.getenv('REDIS_DB', 5))
@@ -62,6 +70,8 @@ class Config:
     TEXT_EMBEDDING_DIM = int(os.getenv("TEXT_EMBEDDING_DIM", "1024"))
     TEXT_EMBEDDING_BATCH_SIZE = int(os.getenv("TEXT_EMBEDDING_BATCH_SIZE", "32"))
     TEXT_EMBEDDING_NORMALIZE = os.getenv("TEXT_EMBEDDING_NORMALIZE", "true").lower() in {"1", "true", "yes", "on"}
+    HTTP_REQUEST_TIMEOUT = float(os.getenv("HTTP_REQUEST_TIMEOUT", "180"))
+    HTTP_MAX_RETRIES = int(os.getenv("HTTP_MAX_RETRIES", "2"))
     TEXT_EMBEDDING_QUERY_INSTRUCTION = os.getenv(
         "TEXT_EMBEDDING_QUERY_INSTRUCTION",
         "Given a web search query, retrieve relevant passages that answer the query",
@@ -137,20 +147,27 @@ class Config:
             )
         return cls.TEXT_EMBEDDING_DIM
 
+    _embeddings_instance = None
+    _milvus_store_cache = {}
+    _chat_model_cache = {}
+
     @classmethod
     def get_embeddings(cls):
         if not cls.LLM_GATEWAY_API_KEY:
              raise ValueError("LLM gateway API key not found in environment variables.")
-
-        return GatewayEmbeddings(
-            api_key=cls.LLM_GATEWAY_API_KEY,
-            base_url=cls.get_embedding_base_url(),
-            model=cls.get_text_embedding_target(),
-            dimension=cls.get_text_embedding_dimension(),
-            normalize=cls.TEXT_EMBEDDING_NORMALIZE,
-            batch_size=cls.TEXT_EMBEDDING_BATCH_SIZE,
-            query_instruction=cls.TEXT_EMBEDDING_QUERY_INSTRUCTION,
-        )
+        if cls._embeddings_instance is None:
+            cls._embeddings_instance = GatewayEmbeddings(
+                api_key=cls.LLM_GATEWAY_API_KEY,
+                base_url=cls.get_embedding_base_url(),
+                model=cls.get_text_embedding_target(),
+                dimension=cls.get_text_embedding_dimension(),
+                normalize=cls.TEXT_EMBEDDING_NORMALIZE,
+                batch_size=cls.TEXT_EMBEDDING_BATCH_SIZE,
+                query_instruction=cls.TEXT_EMBEDDING_QUERY_INSTRUCTION,
+                request_timeout=cls.HTTP_REQUEST_TIMEOUT,
+                max_retries=cls.HTTP_MAX_RETRIES,
+            )
+        return cls._embeddings_instance
 
     @classmethod
     def get_milvus_store(cls, collection_name):
@@ -159,24 +176,63 @@ class Config:
             text_field = "text"
         else:
             text_field = "content"
-            
-        return Milvus(
-            embedding_function=cls.get_embeddings(),
-            connection_args={"host": cls.MILVUS_HOST, "port": cls.MILVUS_PORT},
-            collection_name=collection_name,
-            text_field=text_field
+
+        # Milvus Lite (embedded) mode via MILVUS_LITE_URI; otherwise standard remote server.
+        # Use uri form ("http://host:port"): langchain_milvus >= 0.2 passes connection_args
+        # straight to MilvusClient(**kwargs), which IGNORES host/port (silently falls back
+        # to localhost). The uri form works for both MilvusClient and ORM connections.connect.
+        if cls.MILVUS_LITE_URI:
+            # milvus-lite 内嵌 gRPC 服务端对高频 keepalive ping 限流（too_many_pings GOAWAY），
+            # pymilvus 默认 10s ping 会周期性杀死空闲 channel 引发连接竞态；调高 ping 间隔规避。
+            # 仅影响 Lite 模式；远程模式分支保持原样。
+            connection_args = {
+                "uri": cls.MILVUS_LITE_URI,
+                "grpc_options": {
+                    "grpc.keepalive_time_ms": 600000,
+                    "grpc.keepalive_timeout_ms": 20000,
+                    "grpc.keepalive_permit_without_calls": False,
+                },
+            }
+        else:
+            connection_args = {"uri": f"http://{cls.MILVUS_HOST}:{cls.MILVUS_PORT}"}
+            # Optional dedicated database for experiment isolation (Milvus >= 2.3).
+            if cls.MILVUS_DB_NAME:
+                connection_args["db_name"] = cls.MILVUS_DB_NAME
+
+        cache_key = (
+            collection_name,
+            cls.MILVUS_LITE_URI or f"{cls.MILVUS_HOST}:{cls.MILVUS_PORT}/{cls.MILVUS_DB_NAME}",
         )
+        if cache_key not in cls._milvus_store_cache:
+            cls._milvus_store_cache[cache_key] = Milvus(
+                embedding_function=cls.get_embeddings(),
+                connection_args=connection_args,
+                collection_name=collection_name,
+                text_field=text_field,
+                timeout=30,
+            )
+        return cls._milvus_store_cache[cache_key]
+
 
     @classmethod
-    def _build_chat_model(cls, model_name: str):
+    def _build_chat_model(cls, model_name: str, temperature=None):
         if not cls.LLM_GATEWAY_API_KEY:
              raise ValueError("LLM gateway API key not found in environment variables.")
-        return ChatOpenAI(
-            base_url=cls.get_chat_base_url(),
-            api_key=cls.LLM_GATEWAY_API_KEY,
-            model=model_name,
-            streaming=True,
-        )
+        cache_key = (model_name, temperature)
+        if cache_key not in cls._chat_model_cache:
+            kwargs = {
+                "base_url": cls.get_chat_base_url(),
+                "api_key": cls.LLM_GATEWAY_API_KEY,
+                "model": model_name,
+                "streaming": True,
+                "timeout": cls.HTTP_REQUEST_TIMEOUT,
+                "max_retries": cls.HTTP_MAX_RETRIES,
+            }
+            if temperature is not None:
+                kwargs["temperature"] = temperature
+            cls._chat_model_cache[cache_key] = ChatOpenAI(**kwargs)
+        return cls._chat_model_cache[cache_key]
+
 
     @classmethod
     def get_utility_llm(cls):
@@ -188,12 +244,4 @@ class Config:
 
     @classmethod
     def get_extraction_llm(cls, temperature: float = 0.1):
-        if not cls.LLM_GATEWAY_API_KEY:
-             raise ValueError("LLM gateway API key not found in environment variables.")
-        return ChatOpenAI(
-            base_url=cls.get_chat_base_url(),
-            api_key=cls.LLM_GATEWAY_API_KEY,
-            model=cls.LLM_MODEL_EXTRACTION,
-            streaming=True,
-            temperature=temperature,
-        )
+        return cls._build_chat_model(cls.LLM_MODEL_EXTRACTION, temperature=temperature)

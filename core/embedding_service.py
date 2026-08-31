@@ -37,6 +37,11 @@ def _embedding_cache_namespace() -> str:
 MILVUS_HOST = os.getenv('MILVUS_HOST', 'localhost')
 MILVUS_PORT = os.getenv('MILVUS_PORT', '19530')
 MILVUS_ALIAS = 'default'
+# Milvus Lite (embedded) mode: when set (e.g. "./milvus.db"), takes precedence over host/port.
+MILVUS_LITE_URI = os.getenv('MILVUS_LITE_URI', '')
+# Dedicated database on a remote Milvus server for experiment isolation (e.g. "exp1_eval").
+# Only effective in host/port mode; must already exist on the server.
+MILVUS_DB_NAME = os.getenv('MILVUS_DB_NAME', '')
 
 class EmbeddingService:
     """
@@ -61,9 +66,11 @@ class EmbeddingService:
         # Try to use Django cache
         cache = None
         try:
-            from django.core.cache import cache as django_cache
-            cache = django_cache
-        except (ImportError, Exception):
+            from django.conf import settings
+            if settings.configured:
+                from django.core.cache import cache as django_cache
+                cache = django_cache
+        except Exception:
             logger.debug("Django cache not available in EmbeddingService")
 
         if use_cache and cache:
@@ -78,7 +85,7 @@ class EmbeddingService:
                     cache_key = f"embedding:{cache_ns}:{hash(text)}"
                     cached_val = cache.get(cache_key)
                     if cached_val:
-                        if len(cached_val) == embedding_dim:
+                        if len(cached_val) == embedding_dim and any(cached_val):
                             cached_embeddings.append((i, cached_val))
                         else:
                             # Cache invalid (wrong dim), treat as uncached
@@ -141,9 +148,11 @@ class EmbeddingService:
         # for redis it blocks but it's fast. Ideally use sync_to_async or async cache client)
         cache = None
         try:
-            from django.core.cache import cache as django_cache
-            cache = django_cache
-        except (ImportError, Exception):
+            from django.conf import settings
+            if settings.configured:
+                from django.core.cache import cache as django_cache
+                cache = django_cache
+        except Exception:
             pass
 
         if use_cache and cache:
@@ -158,7 +167,7 @@ class EmbeddingService:
                     cache_key = f"embedding:{cache_ns}:{hash(text)}"
                     cached_val = cache.get(cache_key)
                     if cached_val:
-                        if len(cached_val) == embedding_dim:
+                        if len(cached_val) == embedding_dim and any(cached_val):
                             cached_embeddings.append((i, cached_val))
                         else:
                             uncached_texts.append(text)
@@ -212,10 +221,30 @@ def generate_embedding(text: str) -> List[float]:
 from pymilvus import connections, Collection, utility, DataType, FieldSchema, CollectionSchema
 
 def ensure_milvus_connection():
+    grpc_options = {
+        "grpc.keepalive_time_ms": 600_000,
+        "grpc.keepalive_timeout_ms": 20_000,
+        "grpc.keepalive_permit_without_calls": False,
+    }
     try:
-        connections.connect(alias=MILVUS_ALIAS, host=MILVUS_HOST, port=MILVUS_PORT)
+        if MILVUS_LITE_URI:
+            connections.connect(
+                alias=MILVUS_ALIAS,
+                uri=MILVUS_LITE_URI,
+                grpc_options=grpc_options,
+            )
+        else:
+            kwargs = {
+                "host": MILVUS_HOST,
+                "port": MILVUS_PORT,
+                "grpc_options": grpc_options,
+            }
+            if MILVUS_DB_NAME:
+                kwargs["db_name"] = MILVUS_DB_NAME
+            connections.connect(alias=MILVUS_ALIAS, **kwargs)
     except Exception as e:
         logger.error(f"Failed to connect to Milvus: {e}")
+        raise
 
 def get_or_create_collection(collection_name: str, dim: Optional[int] = None) -> Collection:
     ensure_milvus_connection()

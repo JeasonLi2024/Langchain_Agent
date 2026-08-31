@@ -46,27 +46,48 @@ async def retrieve_tags(queries: list[str]) -> dict:
     """Retrieve relevant interest and skill tags from Milvus based on queries."""
     interest_store = Config.get_milvus_store("student_interests")
     skill_store = Config.get_milvus_store("student_skills")
-    
+
     interest_results = {}
     skill_results = {}
-    
-    for q in queries:
+
+    # Both collections use the same embedding model and each query vector is identical.
+    # Compute each query once, then search both stores by vector to remove duplicate gateway calls
+    # without changing embedding request granularity, candidate k, de-duplication, score ordering,
+    # or output format.
+    embedder = Config.get_embeddings()
+    query_vectors = []
+    for query in queries:
+        query_vectors.append(await embedder.aembed_query(query))
+
+    retrieval_errors = []
+    for q, vector in zip(queries, query_vectors):
         try:
-            # Interest Search
-            docs_int = await interest_store.asimilarity_search_with_score(q, k=5)
+            docs_int, docs_skill = await asyncio.gather(
+                interest_store.asimilarity_search_with_score_by_vector(vector, k=5),
+                skill_store.asimilarity_search_with_score_by_vector(vector, k=5),
+            )
             for doc, score in docs_int:
                 doc_id = doc.metadata.get('id')
                 if doc_id not in interest_results:
                     interest_results[doc_id] = (doc, score)
-            
-            # Skill Search
-            docs_skill = await skill_store.asimilarity_search_with_score(q, k=5)
+
             for doc, score in docs_skill:
                 doc_id = doc.metadata.get('id')
                 if doc_id not in skill_results:
                     skill_results[doc_id] = (doc, score)
-        except Exception as e:
-            print(f"Error in retrieval for '{q}': {e}")
+        except Exception as exc:
+            retrieval_errors.append(f"{q!r}: {exc}")
+
+    # Do not let an incomplete candidate set silently become a successful recommendation.
+    # This only changes infrastructure-failure semantics; successful retrieval keeps the
+    # production query granularity, k, de-duplication, score ordering, and prompt context.
+    if retrieval_errors:
+        raise RuntimeError("tag retrieval failed: " + "; ".join(retrieval_errors))
+    if not interest_results or not skill_results:
+        raise RuntimeError(
+            "tag retrieval returned no candidates for "
+            + ("student_interests" if not interest_results else "student_skills")
+        )
 
     # Format Output
     context_str = "Matched Interest Tags:\n"

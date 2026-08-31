@@ -23,6 +23,8 @@ class GatewayEmbeddings(Embeddings):
         normalize: bool = True,
         batch_size: int = 32,
         query_instruction: str = DEFAULT_QUERY_INSTRUCTION,
+        request_timeout: float = 180.0,
+        max_retries: int = 2,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url
@@ -31,9 +33,17 @@ class GatewayEmbeddings(Embeddings):
         self.normalize = normalize
         self.batch_size = batch_size
         self.query_instruction = query_instruction
+        self.request_timeout = request_timeout
+        self.max_retries = max_retries
+        self._client = OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=self.request_timeout,
+            max_retries=self.max_retries,
+        )
 
     def _build_client(self) -> OpenAI:
-        return OpenAI(api_key=self.api_key, base_url=self.base_url)
+        return self._client
 
     def _prepare_inputs(self, inputs: List[str], is_query: bool) -> List[str]:
         if not is_query:
